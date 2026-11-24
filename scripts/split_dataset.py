@@ -33,14 +33,15 @@ def run(cfg, args) -> None:
     import pandas as pd
 
     from src import spatial_split as S
-    from src.runs import data_lineage, finish_run, fingerprint, new_run_dir, reusable_run, write_json
+    from src.runs import data_lineage, finish_run, new_run_dir, point_latest, reusable_run, split_fingerprint, write_json
     from src.visualization import plot_split_map
 
     prep_run, prep_meta = data_lineage(cfg, ROOT, "prep")["prep"]
     log(STAGE, f"using {prep_run.name}")
-    fp = fingerprint(prep_run.name, cfg["split"], cfg["patching"])
+    fp = split_fingerprint(cfg, prep_run.name)
     reuse = None if args.force else reusable_run(ROOT / cfg["paths"]["splits_dir"], ROOT, fp)
     if reuse:
+        point_latest(reuse, ROOT)
         log(STAGE, f"inputs and config unchanged: reusing {reuse.name} (use --force to rebuild)")
         return
     lc = np.load(prep_run / "landcover.npy", mmap_mode="r")

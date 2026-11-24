@@ -40,6 +40,13 @@ def load_config(path: str | Path) -> dict[str, Any]:
         cfg = yaml.safe_load(f)
     if not isinstance(cfg, dict):
         raise ValueError(f"Config {path} is empty or not a mapping")
+    if "base" in cfg:  # experiment overlay: deep-merge onto the base config
+        base_path = (path.parent / cfg.pop("base")).resolve()
+        overlay, cfg = cfg, _load_raw(base_path)
+        _deep_merge(cfg, overlay)
+        cfg["config_chain"] = [str(base_path), str(path.resolve())]
+    cfg.setdefault("features", {"indices": []})
+    cfg["model"].setdefault("upsampling", "transpose")
 
     required = ["paths", "grid", "s2", "hansen", "worldcover", "split", "patching",
                 "model", "loss", "training", "evaluation", "validation"]
@@ -52,8 +59,16 @@ def load_config(path: str | Path) -> dict[str, Any]:
     if mode not in ("as_channel", "drop"):
         raise ValueError(f"s2.nobs_mode must be 'as_channel' or 'drop', got {mode!r}")
     channels = 2 * (n_bands if mode == "as_channel" else n_bands - 1)
+    indices = cfg["features"].get("indices") or []
+    unknown = sorted(set(indices) - {"ndvi", "nbr", "ndmi"})
+    if unknown:
+        raise ValueError(f"features.indices: unknown index {unknown}; allowed ndvi, nbr, ndmi")
+    channels += 3 * len(indices)  # per index: pre, post, post - pre
     if cfg["model"]["input_channels"] != channels:
-        raise ValueError(f"model.input_channels={cfg['model']['input_channels']} but s2.nobs_mode={mode} gives {channels}")
+        raise ValueError(f"model.input_channels={cfg['model']['input_channels']} but s2.nobs_mode={mode} "
+                         f"and features.indices={indices} give {channels}")
+    if cfg["model"]["upsampling"] not in ("transpose", "bilinear"):
+        raise ValueError("model.upsampling must be 'transpose' or 'bilinear'")
     if cfg["split"]["block_size_px"] % cfg["patching"]["patch_size"]:
         raise ValueError("split.block_size_px must be a multiple of patching.patch_size")
     if cfg["evaluation"]["deforestation_threshold"]["tune_on"] != "val":
@@ -65,6 +80,27 @@ def load_config(path: str | Path) -> dict[str, Any]:
         raise ValueError(f"worldcover.raw_to_model must map to classes 0..{n_cls - 1} exactly once, got {kept}")
     cfg["worldcover"]["raw_to_model"] = mapping
     return cfg
+
+
+def _load_raw(path: Path) -> dict[str, Any]:
+    import yaml
+
+    with open(path, encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+    if "base" in cfg:
+        base_path = (path.parent / cfg.pop("base")).resolve()
+        overlay, cfg = cfg, _load_raw(base_path)
+        _deep_merge(cfg, overlay)
+    return cfg
+
+
+def _deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> None:
+    """Recursively merge overlay into base (overlay wins; lists are replaced, not merged)."""
+    for k, v in overlay.items():
+        if isinstance(v, dict) and isinstance(base.get(k), dict):
+            _deep_merge(base[k], v)
+        else:
+            base[k] = v
 
 
 def set_global_seed(seed: int, tensorflow: bool = True) -> None:

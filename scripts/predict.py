@@ -45,7 +45,7 @@ def run(cfg, args) -> None:
     import src.losses  # noqa: F401  (registers custom objects)
     import src.metrics  # noqa: F401
     from src.inference import LANDCOVER_COLORS, area_summary, predict_scene, write_geotiff
-    from src.preprocessing import build_input_stack, compute_valid_mask, normalize
+    from src.preprocessing import build_input_stack, compute_valid_mask, model_input
     from src.runs import finish_run, load_run, new_run_dir, read_json, resolve_latest, write_json
     from src.validation import require_validated_raw_data
     from src.visualization import plot_scene_maps, stretch_rgb
@@ -92,7 +92,7 @@ def run(cfg, args) -> None:
     if names != stats["channels"]:
         raise RuntimeError(f"input channels {names} differ from the training channels {stats['channels']}")
     del pre, post
-    x = normalize(stack, stats)
+    x = model_input(stack, stats, list(tmeta.get("indices") or []))
     log(STAGE, f"input {stack.shape} from {Path(pre_path).name} + {Path(post_path).name}; valid {valid.mean():.2%}; threshold {thr:.2f} ({thr_src})")
 
     model = keras.models.load_model(train_run / "best.keras", compile=False)

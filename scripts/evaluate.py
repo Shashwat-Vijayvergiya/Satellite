@@ -32,6 +32,9 @@ STAGE = "evaluate"
 
 def add_args(p) -> None:
     p.add_argument("--run", type=Path, help="Train run dir (default: latest complete run)")
+    p.add_argument("--val-only", action="store_true",
+                   help="Model selection mode: tune the threshold and report VALIDATION metrics only; the test "
+                        "region is not touched and the main evaluation pointer is not changed")
 
 
 def resolve_train_run(cfg, args):
@@ -43,10 +46,10 @@ def resolve_train_run(cfg, args):
                           "latest_smoke.json" if args.smoke_test else "latest.json")
 
 
-def predict_patches(model, paths, stats, batch, patch):
+def predict_patches(model, paths, stats, batch, patch, indices=None):
     from src.dataset import make_dataset
 
-    ds = make_dataset(paths, stats, batch, shuffle=False, augment_data=False, seed=0, patch_size=patch)
+    ds = make_dataset(paths, stats, batch, shuffle=False, augment_data=False, seed=0, patch_size=patch, indices=indices)
     lc_t, lc_p, df_t, df_p = [], [], [], []
     for x, y in ds:
         out = model.predict_on_batch(x)
@@ -68,9 +71,15 @@ def run(cfg, args) -> None:
     from src.visualization import (plot_confusion_matrix, plot_patch_examples, plot_pr_curves, plot_threshold_curve,
                                    stretch_rgb)
 
+    from src import load_config
+
     smoke = args.smoke_test
     train_run, tmeta = resolve_train_run(cfg, args)
-    patch_run, patch_meta = data_lineage(cfg, ROOT, "patches")["patches"]
+    # Resolve the data with the model's OWN saved config, so each experiment is
+    # evaluated on exactly the data (and features) it was trained for.
+    run_cfg = load_config(train_run / "run_config.yaml")
+    indices = list(tmeta.get("indices") or [])
+    patch_run, patch_meta = data_lineage(run_cfg, ROOT, "patches")["patches"]
     if tmeta["patch_run_id"] != patch_run.name:
         raise RuntimeError(f"{train_run.name} was trained on {tmeta['patch_run_id']}, but the current patch run is "
                            f"{patch_run.name}. Retrain, or the split/test region may not match.")
@@ -84,14 +93,15 @@ def run(cfg, args) -> None:
     batch = int(cfg["prediction"]["batch_size"])
     seed = int(cfg["project"]["seed"])
 
-    paths = {s: split_paths(manifest, s, patch_run) for s in ("val", "test")}
+    splits = ("val",) if args.val_only else ("val", "test")
+    paths = {s: split_paths(manifest, s, patch_run) for s in splits}
     if smoke:
         n = int(cfg["training"]["smoke_test"]["max_patches_per_split"])
         paths = {s: limit_for_smoke_test(v, n, seed) for s, v in paths.items()}
     preds = {}
-    for s in ("val", "test"):
+    for s in splits:
         log(STAGE, f"predicting {len(paths[s])} {s} patches")
-        preds[s] = predict_patches(model, paths[s], stats, batch, p)
+        preds[s] = predict_patches(model, paths[s], stats, batch, p, indices)
 
     # --- threshold: VALIDATION ONLY ---------------------------------------
     tcfg = cfg["evaluation"]["deforestation_threshold"]
@@ -102,7 +112,7 @@ def run(cfg, args) -> None:
     log(STAGE, f"threshold tuned on VALIDATION ({tcfg['metric']}): {thr:.2f}")
 
     results = {"threshold": {"value": thr, "tuned_on": "val", "metric": tcfg["metric"]}, "splits": {}}
-    for s in ("val", "test"):
+    for s in splits:
         lc_t, lc_p, df_t, df_p = preds[s]
         cm = M.confusion_matrix(lc_t, lc_p, k)
         lc_rep = M.landcover_report(cm, classes)
@@ -113,6 +123,23 @@ def run(cfg, args) -> None:
         pred_share = np.bincount(valid_pred, minlength=k) / max(valid_pred.size, 1)
         lc_rep["predicted_share"] = dict(zip(classes, pred_share.round(4).tolist()))
         results["splits"][s] = {"landcover": lc_rep, "deforestation": df_rep, "n_patches": len(paths[s])}
+
+    if args.val_only:
+        v = results["splits"]["val"]
+        score = v["landcover"]["mean_iou"] + v["deforestation"]["pr_auc"]
+        results["selection"] = {"rule": "val landcover mIoU + val forest-loss PR-AUC", "score": score}
+        out = new_run_dir(ROOT / cfg["evaluation"]["report_dir"] / "evaluation", "val_eval")
+        write_json(out / "metrics_val_only.json", results)
+        finish_run(out, ROOT, {"stage": STAGE, "mode": "val_only", "train_run_id": train_run.name,
+                               "experiment": tmeta.get("experiment"), "patch_run_id": patch_run.name, "threshold": thr,
+                               "selection_score": score}, latest_name="latest_val_only.json")
+        lc_v, df_v = v["landcover"], v["deforestation"]
+        log(STAGE, f"VAL land cover: OA {lc_v['overall_accuracy']:.4f}, mIoU {lc_v['mean_iou']:.4f}; per-class IoU "
+                   + ", ".join(f"{n} {c['iou']:.3f}" for n, c in lc_v["per_class"].items()))
+        log(STAGE, f"VAL forest loss @ {thr:.2f}: P {df_v['precision']:.4f}, R {df_v['recall']:.4f}, F1 {df_v['f1']:.4f}, "
+                   f"PR-AUC {df_v['pr_auc']:.4f}")
+        log(STAGE, f"SELECTION SCORE (val mIoU + val PR-AUC) = {score:.4f}; report {out.relative_to(ROOT)}")
+        return
 
     # --- trivial baselines on TEST (context for the scores) ----------------
     tr = manifest[manifest["split"] == "train"]

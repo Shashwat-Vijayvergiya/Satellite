@@ -107,7 +107,7 @@ with tab_live:
     from rasterio.windows import Window
 
     from src.inference import predict_scene
-    from src.preprocessing import build_input_stack, compute_valid_mask, normalize
+    from src.preprocessing import build_input_stack, compute_valid_mask, model_input
     from src.visualization import landcover_rgb, stretch_rgb
 
     g = CFG["grid"]
@@ -134,7 +134,7 @@ with tab_live:
         stack, ch = build_input_stack(pre, post, CFG)
         model = load_model()
         with st.spinner("Predicting..."):
-            lc_prob, df_prob = predict_scene(lambda bt: model.predict_on_batch(bt), normalize(stack, stats), 128,
+            lc_prob, df_prob = predict_scene(lambda bt: model.predict_on_batch(bt), model_input(stack, stats, list(tmeta.get("indices") or [])), 128,
                                              CFG["prediction"]["overlap"], 16, len(CLASSES))
         thr = float(emeta["threshold"])
         lc_pred = np.argmax(lc_prob, -1).astype(np.uint8)

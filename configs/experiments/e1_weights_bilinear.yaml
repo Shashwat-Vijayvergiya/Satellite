@@ -1,0 +1,7 @@
+# E1: cap class weights at 3 (built-up was 6.9) + bilinear upsampling.
+base: ../config.yaml
+model:
+  upsampling: bilinear
+loss:
+  landcover:
+    class_weight_clip: [0.2, 3.0]

@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from src.preprocessing import normalize
+from src.preprocessing import model_input
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -29,6 +29,8 @@ def load_manifest(patch_run: Path) -> "pd.DataFrame":
     df = pd.read_csv(patch_run / "manifest.csv")
     if df.empty:
         raise RuntimeError(f"manifest in {patch_run.name} is empty")
+    if "overlap_extra" not in df.columns:  # manifests written before overlapping train patches existed
+        df["overlap_extra"] = False
     return df
 
 
@@ -84,19 +86,20 @@ def augment(x: "tf.Tensor", lc: "tf.Tensor", df: "tf.Tensor") -> tuple["tf.Tenso
 
 
 def make_dataset(paths: list[str], stats: dict[str, Any], batch_size: int, shuffle: bool, augment_data: bool,
-                 seed: int, patch_size: int) -> "tf.data.Dataset":
+                 seed: int, patch_size: int, indices: list[str] | None = None) -> "tf.data.Dataset":
     """Yield (image float32 (B,P,P,C), {"landcover": int32 (B,P,P,1), "deforestation": float32 (B,P,P,1)})."""
     import tensorflow as tf
 
     if not paths:
         raise ValueError("no patch paths given")
-    n_ch = len(stats["channels"])
+    n_raw = len(stats["channels"])
+    n_ch = n_raw + 3 * len(indices or [])
 
     def _load(p: bytes):
         img, lc, df = load_patch(p.decode())
-        if img.shape != (patch_size, patch_size, n_ch):
-            raise ValueError(f"{p.decode()}: image shape {img.shape} != {(patch_size, patch_size, n_ch)}")
-        return normalize(img, stats), lc[..., None].astype(np.int32), df[..., None].astype(np.float32)
+        if img.shape != (patch_size, patch_size, n_raw):
+            raise ValueError(f"{p.decode()}: image shape {img.shape} != {(patch_size, patch_size, n_raw)}")
+        return model_input(img, stats, indices), lc[..., None].astype(np.int32), df[..., None].astype(np.float32)
 
     def _tf_load(p):
         x, lc, df = tf.numpy_function(_load, [p], [tf.float32, tf.int32, tf.float32])

@@ -184,8 +184,11 @@ def test_make_dataset_shapes_and_normalisation(tmp_path: Path) -> None:
         np.savez(p, image=rng.integers(100, 3000, (16, 16, 12)).astype(np.uint16),
                  landcover=rng.integers(0, 5, (16, 16)).astype(np.uint8), deforest=np.full((16, 16), 255, np.uint8))
         paths.append(str(p))
-    stats = {"channels": [f"c{i}" for i in range(12)], "p_low": [0] * 12, "p_high": [10000] * 12,
+    names = [f"{d}_{b}" for d in ("pre", "post") for b in ("B2", "B3", "B4", "B8", "B11", "B12")]
+    stats = {"channels": names, "p_low": [0] * 12, "p_high": [10000] * 12,
              "mean": [1000] * 12, "std": [500] * 12}
+    ds_idx = make_dataset(paths, stats, 2, shuffle=False, augment_data=False, seed=0, patch_size=16, indices=["ndvi", "nbr"])
+    assert next(iter(ds_idx))[0].shape == (2, 16, 16, 18)
     ds = make_dataset(paths, stats, 2, shuffle=False, augment_data=True, seed=0, patch_size=16)
     batches = list(ds)
     assert len(batches) == 3
@@ -233,3 +236,62 @@ def test_unchanged_inputs_reuse_run_and_changes_do_not(tmp_path: Path) -> None:
     assert reusable_run(base, tmp_path, fingerprint("sha-abc", {"s2": {"nobs_mode": "drop"}})) == run
     assert reusable_run(base, tmp_path, fingerprint("sha-abc", {"s2": {"nobs_mode": "as_channel"}})) is None  # config changed
     assert reusable_run(base, tmp_path, fingerprint("sha-NEW", cfg)) is None                                   # raw data changed
+
+
+# ---------------------------------------------------------------- experiments
+def test_config_overlay_deep_merges_onto_base(tmp_path: Path) -> None:
+    import shutil
+
+    shutil.copy(ROOT / "configs" / "config.yaml", tmp_path / "config.yaml")
+    (tmp_path / "exp.yaml").write_text(
+        "base: config.yaml\nmodel:\n  upsampling: bilinear\n  input_channels: 18\nfeatures:\n  indices: [ndvi, nbr]\n")
+    c = load_config(tmp_path / "exp.yaml")
+    assert c["model"]["upsampling"] == "bilinear" and c["model"]["input_channels"] == 18
+    assert c["model"]["base_filters"] == 16                 # untouched keys come from the base
+    assert c["features"]["indices"] == ["ndvi", "nbr"]
+    (tmp_path / "bad.yaml").write_text("base: config.yaml\nfeatures:\n  indices: [ndvi]\n")  # 12 + 3 != 12
+    with pytest.raises(ValueError, match="input_channels"):
+        load_config(tmp_path / "bad.yaml")
+
+
+def test_indices_values_and_model_input_shape(cfg) -> None:
+    names = P.channel_layout(cfg)[1]
+    img = np.zeros((2, 2, 12), np.uint16)
+    img[..., names.index("pre_B8")], img[..., names.index("pre_B4")], img[..., names.index("pre_B12")] = 3000, 1000, 2000
+    img[..., names.index("post_B8")], img[..., names.index("post_B4")], img[..., names.index("post_B12")] = 1000, 1000, 3000
+    ind = P.compute_indices(img, names, ["ndvi", "nbr"])
+    assert ind.shape == (2, 2, 6) and P.index_channel_names(["ndvi", "nbr"])[2] == "dndvi"
+    np.testing.assert_allclose(ind[0, 0], [0.5, 0.0, -0.5, 0.2, -0.5, -0.7], atol=1e-6)
+    stats = {"channels": names, "p_low": [0] * 12, "p_high": [10000] * 12, "mean": [0] * 12, "std": [1] * 12}
+    assert P.model_input(img, stats, ["ndvi", "nbr"]).shape == (2, 2, 18)
+    assert P.model_input(img, stats, []).shape == (2, 2, 12)
+    zero = P.compute_indices(np.zeros((1, 1, 12), np.uint16), names, ["ndvi"])
+    assert np.isfinite(zero).all() and (zero == 0).all()     # 0/0 -> 0, no NaN
+
+
+def test_overlapping_train_windows_stay_inside_train_cells() -> None:
+    cs = np.array([[0, 0, 1],
+                   [0, 0, 0],
+                   [-1, 0, 0]], dtype=np.int8)
+    wins = S.overlapping_train_windows(cs, 4, 2)
+    assert (2, 2) in wins and (0, 2) in wins                 # spans only train cells
+    assert (0, 6) not in wins                                 # would touch the val cell
+    assert (6, 2) not in wins                                 # would touch the dropped cell
+    assert all((r % 4, c % 4) != (0, 0) for r, c in wins)    # regular grid not duplicated
+    for r, c in wins:
+        assert (cs[r // 4:(r + 3) // 4 + 1, c // 4:(c + 3) // 4 + 1] == 0).all()
+    with pytest.raises(ValueError):
+        S.overlapping_train_windows(cs, 4, 3)
+
+
+def test_fingerprint_lookup_finds_matching_run_not_only_latest(tmp_path: Path) -> None:
+    from src.runs import finish_run, new_run_dir, reusable_run
+
+    base = tmp_path / "patches"
+    a = new_run_dir(base, "patches")
+    finish_run(a, tmp_path, {"fingerprint": "fp-baseline"})
+    b = new_run_dir(base, "patches")
+    finish_run(b, tmp_path, {"fingerprint": "fp-experiment"})   # b is now "latest"
+    assert reusable_run(base, tmp_path, "fp-baseline") == a     # baseline data still found
+    assert reusable_run(base, tmp_path, "fp-experiment") == b
+    assert reusable_run(base, tmp_path, "fp-unknown") is None

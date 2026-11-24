@@ -1,0 +1,6 @@
+# E2 = E1 + NDVI and NBR as extra inputs (pre, post, post - pre): 12 + 6 = 18 channels.
+base: e1_weights_bilinear.yaml
+features:
+  indices: [ndvi, nbr]
+model:
+  input_channels: 18

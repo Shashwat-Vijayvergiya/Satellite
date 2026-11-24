@@ -1,0 +1,4 @@
+# E3 = E2 + overlapping train patches (stride 64, train region only).
+base: e2_indices.yaml
+train_patches:
+  stride: 64

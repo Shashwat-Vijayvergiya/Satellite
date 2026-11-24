@@ -54,3 +54,12 @@ def test_compiled_model_save_load_round_trip(tmp_path: Path) -> None:
     a, b = m.predict_on_batch(x), m2.predict_on_batch(x)
     np.testing.assert_allclose(a["landcover"], b["landcover"], atol=1e-6)
     assert m2.loss["deforestation"].pos_weight == 5.0
+
+
+def test_bilinear_upsampling_variant_shapes() -> None:
+    m = build_multitask_unet((32, 32, 18), 5, base_filters=4, depth=2, upsampling="bilinear")
+    out = m.predict_on_batch(np.zeros((1, 32, 32, 18), np.float32))
+    assert out["landcover"].shape == (1, 32, 32, 5) and out["deforestation"].shape == (1, 32, 32, 1)
+    assert not any(type(l).__name__ == "Conv2DTranspose" for l in m.layers)
+    with pytest.raises(ValueError):
+        build_multitask_unet((32, 32, 12), 5, base_filters=4, depth=2, upsampling="nearest")

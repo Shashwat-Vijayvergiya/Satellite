@@ -31,15 +31,16 @@ def run(cfg, args) -> None:
     import pandas as pd
 
     from src.preprocessing import compute_band_stats
-    from src.runs import data_lineage, finish_run, fingerprint, new_run_dir, reusable_run, write_json
+    from src.runs import data_lineage, finish_run, new_run_dir, patches_fingerprint, point_latest, reusable_run, write_json
 
     lin = data_lineage(cfg, ROOT, "split")
     prep_run, prep_meta = lin["prep"]
     split_run, split_meta = lin["split"]
     log(STAGE, f"using {prep_run.name} and {split_run.name}")
-    fp = fingerprint(prep_run.name, split_run.name, cfg["patching"], cfg["s2"]["normalization"])
+    fp = patches_fingerprint(cfg, prep_run.name, split_run.name)
     reuse = None if args.force else reusable_run(ROOT / cfg["paths"]["patches_dir"], ROOT, fp)
     if reuse:
+        point_latest(reuse, ROOT)
         log(STAGE, f"inputs and config unchanged: reusing {reuse.name} (use --force to rebuild)")
         return
     image = np.load(prep_run / "image.npy", mmap_mode="r")
@@ -51,26 +52,45 @@ def run(cfg, args) -> None:
     names = prep_meta["channel_names"]
     classes = cfg["worldcover"]["class_names"]
 
+    # Optional extra TRAIN patches on a finer grid (e.g. stride 64 = 50 % overlap).
+    # A window is added only if every 128 px cell it touches is a kept TRAIN cell,
+    # so it never reaches into the buffer, validation or test regions.
+    tstride = int(cfg.get("train_patches", {}).get("stride", p))
+    extra = []
+    if tstride != p:
+        from src.spatial_split import make_grid, overlapping_train_windows
+
+        cell_split = np.load(split_run / "cell_split.npy")
+        grid = make_grid(*lc.shape, p, int(cfg["split"]["block_size_px"]))
+        cell_block = grid.cell_block_ids()
+        g = cfg["grid"]
+        for r, c in overlapping_train_windows(cell_split, p, tstride):
+            extra.append({"patch_id": f"x{r:04d}_{c:04d}", "split": "train", "row_off": r, "col_off": c,
+                          "block_id": int(cell_block[r // p, c // p]),
+                          "x_min": g["x0"] + c * g["pixel_size_m"], "y_max": g["ytop"] - r * g["pixel_size_m"]})
+        log(STAGE, f"train stride {tstride}: {len(extra)} extra overlapping train patches")
+
     run_dir = new_run_dir(ROOT / cfg["paths"]["patches_dir"], "patches")
     rows, train_pixels = [], []
     sources = ";".join(Path(v).name for v in prep_meta["source_files"].values())
-    for w in windows.itertuples(index=False):
-        sl = (slice(w.row_off, w.row_off + p), slice(w.col_off, w.col_off + p))
+    all_windows = [(w._asdict(), False) for w in windows.itertuples(index=False)] + [(w, True) for w in extra]
+    for w, is_extra in all_windows:
+        sl = (slice(w["row_off"], w["row_off"] + p), slice(w["col_off"], w["col_off"] + p))
         img, l, d, v = np.array(image[sl]), np.array(lc[sl]), np.array(df[sl]), np.array(valid[sl])
         if img.shape[:2] != (p, p):
-            raise RuntimeError(f"window {w.patch_id} is not {p}x{p}")
-        rel_path = f"{w.split}/{w.patch_id}.npz"
-        (run_dir / w.split).mkdir(exist_ok=True)
+            raise RuntimeError(f"window {w['patch_id']} is not {p}x{p}")
+        rel_path = f"{w['split']}/{w['patch_id']}.npz"
+        (run_dir / w["split"]).mkdir(exist_ok=True)
         np.savez(run_dir / rel_path, image=img, landcover=l, deforest=d)
         lc_bins = np.bincount(l.ravel(), minlength=256)
-        row = {"patch_id": w.patch_id, "split": w.split, "path": rel_path, "source_prep_run": prep_run.name,
-               "source_files": sources, "row_off": w.row_off, "col_off": w.col_off, "block_id": w.block_id,
-               "x_min": w.x_min, "y_max": w.y_max, "valid_pixels": int(v.sum())}
+        row = {"patch_id": w["patch_id"], "split": w["split"], "path": rel_path, "source_prep_run": prep_run.name,
+               "source_files": sources, "row_off": w["row_off"], "col_off": w["col_off"], "block_id": w["block_id"],
+               "x_min": w["x_min"], "y_max": w["y_max"], "valid_pixels": int(v.sum()), "overlap_extra": is_extra}
         row.update({f"lc_{n}": int(lc_bins[i]) for i, n in enumerate(classes)})
         row["lc_ignore"] = int(lc_bins[255])
         row["df_positive"], row["df_negative"], row["df_ignore"] = int((d == 1).sum()), int((d == 0).sum()), int((d == 255).sum())
         rows.append(row)
-        if w.split == "train":
+        if w["split"] == "train" and not is_extra:  # stats from unique pixels only
             train_pixels.append(img[v])
     manifest = pd.DataFrame(rows)
     manifest.to_csv(run_dir / "manifest.csv", index=False)
@@ -81,17 +101,19 @@ def run(cfg, args) -> None:
     write_json(run_dir / "band_stats.json", stats)
 
     counts = {}
-    for s, g in manifest.groupby("split"):
+    base_rows = manifest[~manifest["overlap_extra"]]
+    counts["train_extra_overlapping_patches"] = int(manifest["overlap_extra"].sum())
+    for s, g in base_rows.groupby("split"):
         counts[s] = {"patches": int(len(g)), "df_positive": int(g["df_positive"].sum()), "df_negative": int(g["df_negative"].sum()),
                      "landcover": {n: int(g[f"lc_{n}"].sum()) for n in classes}}
     finish_run(run_dir, ROOT, {"stage": STAGE, "fingerprint": fp, "split_run_id": split_run.name, "prep_run_id": prep_run.name,
-                               "patch_size": p, "stride": int(cfg["patching"]["stride"]), "channel_names": names,
+                               "patch_size": p, "stride": int(cfg["patching"]["stride"]), "train_stride": tstride, "channel_names": names,
                                "n_patches": int(len(manifest)), "counts": counts, "band_stats_file": "band_stats.json",
                                "config": cfg})
     for s in ("train", "val", "test"):
         c = counts.get(s, {"patches": 0, "df_positive": 0})
         log(STAGE, f"{s:5s}: {c['patches']} patches, loss pixels {c['df_positive']:,}")
-    log(STAGE, f"wrote {len(manifest)} patches to {run_dir.relative_to(ROOT)}")
+    log(STAGE, f"wrote {len(manifest)} patches ({counts['train_extra_overlapping_patches']} extra overlapping train) to {run_dir.relative_to(ROOT)}")
 
 
 if __name__ == "__main__":

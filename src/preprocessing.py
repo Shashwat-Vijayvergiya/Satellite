@@ -125,3 +125,46 @@ def normalize(image: np.ndarray, stats: dict[str, Any]) -> np.ndarray:
         raise ValueError(f"image has {image.shape[-1]} channels, stats have {lo.size}")
     x = np.clip(image.astype(np.float32), lo, hi)
     return (x - mean) / std
+
+
+# ----------------------------------------------------------------------------
+# Spectral indices (optional extra input channels, computed at load time)
+# ----------------------------------------------------------------------------
+INDEX_BANDS = {"ndvi": ("B8", "B4"), "nbr": ("B8", "B12"), "ndmi": ("B8", "B11")}
+
+
+def index_channel_names(indices: list[str]) -> list[str]:
+    names = []
+    for idx in indices:
+        names += [f"pre_{idx}", f"post_{idx}", f"d{idx}"]
+    return names
+
+
+def compute_indices(image: np.ndarray, channel_names: list[str], indices: list[str]) -> np.ndarray:
+    """(H, W, 3 * len(indices)) float32: for each index, pre, post and post - pre.
+
+    Normalised differences of raw DN, e.g. NDVI = (B8 - B4) / (B8 + B4), NBR =
+    (B8 - B12) / (B8 + B12). Values lie in [-1, 1] (differences in [-2, 2]), so
+    they need no further scaling. A zero denominator gives 0.
+    """
+    out = []
+    for idx in indices:
+        a, b = INDEX_BANDS[idx]
+        per_date = []
+        for date in ("pre", "post"):
+            x = image[..., channel_names.index(f"{date}_{a}")].astype(np.float32)
+            y = image[..., channel_names.index(f"{date}_{b}")].astype(np.float32)
+            den = x + y
+            per_date.append(np.divide(x - y, den, out=np.zeros_like(den), where=den > 0))
+        out += [per_date[0], per_date[1], per_date[1] - per_date[0]]
+    if not out:
+        return np.zeros(image.shape[:-1] + (0,), np.float32)
+    return np.stack(out, axis=-1)
+
+
+def model_input(image: np.ndarray, stats: dict[str, Any], indices: list[str] | None = None) -> np.ndarray:
+    """Raw DN (..., C) -> model input float32: normalised bands, then optional index channels."""
+    x = normalize(image, stats)
+    if indices:
+        x = np.concatenate([x, compute_indices(image, stats["channels"], indices)], axis=-1)
+    return x

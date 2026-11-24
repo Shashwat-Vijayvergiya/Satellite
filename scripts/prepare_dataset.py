@@ -32,14 +32,15 @@ def add_args(p) -> None:
 
 def run(cfg, args) -> None:
     from src import preprocessing as P
-    from src.runs import finish_run, fingerprint, new_run_dir, reusable_run, write_json
+    from src.runs import finish_run, new_run_dir, point_latest, prep_fingerprint, reusable_run, write_json
     from src.validation import require_validated_raw_data
 
     latest = require_validated_raw_data(cfg, ROOT)
-    fp = fingerprint(latest["sha256"], cfg["grid"], cfg["s2"], cfg["hansen"], cfg["worldcover"])
+    fp = prep_fingerprint(cfg, latest["sha256"])
     base = ROOT / cfg["paths"]["processed_dir"]
     reuse = None if args.force else reusable_run(base, ROOT, fp)
     if reuse:
+        point_latest(reuse, ROOT)
         log(STAGE, f"inputs and config unchanged: reusing {reuse.name} (use --force to rebuild)")
         return
     raw = cfg["paths"]["raw"]

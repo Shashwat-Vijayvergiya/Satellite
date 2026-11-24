@@ -30,6 +30,8 @@ STAGE = "train"
 def add_args(p) -> None:
     p.add_argument("--resume", type=Path, help="Existing train run dir to continue from last.keras")
     p.add_argument("--epochs", type=int, help="Override training.epochs")
+    p.add_argument("--experiment", help="Experiment name: run dir exp_<name>_<ts>, does NOT replace the main model "
+                                       "(updates latest_experiments.json instead of latest.json)")
 
 
 def run(cfg, args) -> None:
@@ -49,8 +51,11 @@ def run(cfg, args) -> None:
     seed = int(cfg["project"]["seed"])
     patch_run, patch_meta = data_lineage(cfg, ROOT, "patches")["patches"]
     stats = read_json(patch_run / "band_stats.json")
-    if len(stats["channels"]) != int(cfg["model"]["input_channels"]):
-        raise RuntimeError(f"patch run has {len(stats['channels'])} channels but model.input_channels={cfg['model']['input_channels']}")
+    indices = list(cfg["features"].get("indices") or [])
+    n_in = len(stats["channels"]) + 3 * len(indices)
+    if n_in != int(cfg["model"]["input_channels"]):
+        raise RuntimeError(f"patch run has {len(stats['channels'])} band channels + {3 * len(indices)} index channels = {n_in}, "
+                           f"but model.input_channels={cfg['model']['input_channels']}")
     manifest = load_manifest(patch_run)
     train_paths, val_paths = split_paths(manifest, "train", patch_run), split_paths(manifest, "val", patch_run)
     batch, epochs = int(t["batch_size"]), int(args.epochs or t["epochs"])
@@ -61,7 +66,8 @@ def run(cfg, args) -> None:
         batch, epochs = int(sm["batch_size"]), int(args.epochs or sm["epochs"])
 
     # Imbalance handling from TRAIN pixel counts (full train split, also in smoke mode).
-    tr = manifest[manifest["split"] == "train"]
+    # Overlapping extra patches are excluded so no pixel is counted twice.
+    tr = manifest[(manifest["split"] == "train") & ~manifest["overlap_extra"]]
     classes = cfg["worldcover"]["class_names"]
     lc_counts = np.array([tr[f"lc_{n}"].sum() for n in classes], dtype=np.int64)
     lcfg, dcfg = cfg["loss"]["landcover"], cfg["loss"]["deforestation"]
@@ -75,8 +81,9 @@ def run(cfg, args) -> None:
     log(STAGE, f"train loss/no-loss pixels {pos:,}/{neg:,} ({pos / (pos + neg):.3%}); pos_weight {pos_weight:.2f}")
 
     p = int(patch_meta["patch_size"])
-    train_ds = make_dataset(train_paths, stats, batch, shuffle=True, augment_data=bool(t["augment"]), seed=seed, patch_size=p)
-    val_ds = make_dataset(val_paths, stats, batch, shuffle=False, augment_data=False, seed=seed, patch_size=p)
+    train_ds = make_dataset(train_paths, stats, batch, shuffle=True, augment_data=bool(t["augment"]), seed=seed, patch_size=p,
+                            indices=indices)
+    val_ds = make_dataset(val_paths, stats, batch, shuffle=False, augment_data=False, seed=seed, patch_size=p, indices=indices)
 
     initial_epoch = 0
     if args.resume:
@@ -91,7 +98,8 @@ def run(cfg, args) -> None:
             raise RuntimeError(f"run already completed {initial_epoch} epochs (target {epochs}); pass --epochs N with N > {initial_epoch}")
         log(STAGE, f"resuming {run_dir.name} from epoch {initial_epoch}")
     else:
-        run_dir = new_run_dir(ROOT / t["checkpoint_dir"], "smoke" if smoke else "train")
+        prefix = "smoke" if smoke else (f"exp_{args.experiment}" if args.experiment else "train")
+        run_dir = new_run_dir(ROOT / t["checkpoint_dir"], prefix)
         model = build_from_config(cfg["model"], p)
         losses, task_weights = build_losses(cfg["loss"], class_weights.tolist(), pos_weight)
         k = len(classes)
@@ -105,6 +113,9 @@ def run(cfg, args) -> None:
         write_json(run_dir / "train_info.json", {"patch_run_id": patch_run.name, "split_run_id": patch_meta["split_run_id"],
                                                   "prep_run_id": patch_meta["prep_run_id"], "smoke_test": smoke,
                                                   "class_weights": class_weights.tolist(), "pos_weight": pos_weight,
+                                                  "experiment": args.experiment, "indices": indices,
+                                                  "upsampling": cfg["model"]["upsampling"],
+                                                  "config_chain": cfg.get("config_chain"),
                                                   "train_patches": len(train_paths), "val_patches": len(val_paths),
                                                   "batch_size": batch, "params": int(model.count_params())})
         (run_dir / "run_config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False), encoding="utf-8")
@@ -148,7 +159,7 @@ def run(cfg, args) -> None:
     finish_run(run_dir, ROOT, {"stage": STAGE, **read_json(run_dir / "train_info.json"), "epochs_run": int(len(hist)),
                                "best_epoch": int(best["epoch"]) + 1, "best_epoch_metrics": final,
                                "train_seconds_this_session": round(elapsed, 1), "config": cfg},
-               latest_name="latest_smoke.json" if smoke else "latest.json")
+               latest_name="latest_smoke.json" if smoke else ("latest_experiments.json" if args.experiment else "latest.json"))
     log(STAGE, f"best epoch {int(best['epoch']) + 1}: val_loss {best['val_loss']:.4f}, "
                f"val LC mIoU {best.get('val_landcover_miou', float('nan')):.3f}, val loss-F1@0.5 {best.get('val_deforestation_f1', float('nan')):.3f}")
     log(STAGE, f"trained {len(hist)} epochs in {elapsed / 60:.1f} min; checkpoints in {run_dir.relative_to(ROOT)}")

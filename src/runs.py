@@ -103,33 +103,22 @@ def require_parent(child_meta: dict[str, Any], key: str, parent_run_id: str, chi
         )
 
 
-def data_lineage(cfg: dict[str, Any], root: Path, upto: str) -> dict[str, Any]:
-    """Resolve and cross-check the current data runs: validation -> prep -> split -> patches.
+def prep_fingerprint(cfg: dict[str, Any], raw_sha256: dict[str, Any]) -> str:
+    return fingerprint(raw_sha256, cfg["grid"], cfg["s2"], cfg["hansen"], cfg["worldcover"])
 
-    upto: "prep", "split" or "patches". Raises RuntimeError on any stale link.
-    """
-    from src.validation import require_validated_raw_data
 
-    stages = ["prep", "split", "patches"]
-    if upto not in stages:
-        raise ValueError(f"upto must be one of {stages}")
-    p = cfg["paths"]
-    out: dict[str, Any] = {"validation": require_validated_raw_data(cfg, root)}
-    prep_run, prep_meta = resolve_latest(root / p["processed_dir"], root, "prepare_dataset")
-    if prep_meta.get("raw_sha256") != out["validation"]["sha256"]:
-        raise RuntimeError(f"Stale prepare_dataset run {prep_run.name}: raw files differ from the ones it was built from. Re-run prepare_dataset.")
-    out["prep"] = (prep_run, prep_meta)
-    if upto == "prep":
-        return out
-    split_run, split_meta = resolve_latest(root / p["splits_dir"], root, "split_dataset")
-    require_parent(split_meta, "prep_run_id", prep_run.name, "split_dataset", "prepare_dataset")
-    out["split"] = (split_run, split_meta)
-    if upto == "split":
-        return out
-    patch_run, patch_meta = resolve_latest(root / p["patches_dir"], root, "create_patches")
-    require_parent(patch_meta, "split_run_id", split_run.name, "create_patches", "split_dataset")
-    out["patches"] = (patch_run, patch_meta)
-    return out
+def split_fingerprint(cfg: dict[str, Any], prep_run_id: str) -> str:
+    return fingerprint(prep_run_id, cfg["split"], cfg["patching"])
+
+
+def patches_fingerprint(cfg: dict[str, Any], prep_run_id: str, split_run_id: str) -> str:
+    parts: list[Any] = [prep_run_id, split_run_id, cfg["patching"], cfg["s2"]["normalization"]]
+    tp = cfg.get("train_patches", {})
+    # The default (no extra overlapping train patches) is left out so that
+    # fingerprints of runs built before this option existed stay valid.
+    if int(tp.get("stride", cfg["patching"]["patch_size"])) != int(cfg["patching"]["patch_size"]):
+        parts.append({"train_patches": tp})
+    return fingerprint(*parts)
 
 
 def fingerprint(*parts: Any) -> str:
@@ -141,9 +130,54 @@ def fingerprint(*parts: Any) -> str:
 
 
 def reusable_run(base: Path, root: Path, fp: str) -> Path | None:
-    """Latest complete run under base if it was built with the same fingerprint, else None."""
-    try:
-        run_dir, meta = resolve_latest(base, root, "stage")
-    except RuntimeError:
+    """Newest COMPLETE run under base built with fingerprint fp (any run, not only the latest), else None."""
+    if not base.is_dir():
         return None
-    return run_dir if meta.get("fingerprint") == fp else None
+    for run_dir in sorted((d for d in base.iterdir() if d.is_dir()), key=lambda d: d.name, reverse=True):
+        meta_path = run_dir / "metadata.json"
+        if not meta_path.is_file():
+            continue
+        meta = read_json(meta_path)
+        if meta.get("status") == "complete" and meta.get("fingerprint") == fp:
+            return run_dir
+    return None
+
+
+def point_latest(run_dir: Path, root: Path, latest_name: str = "latest.json") -> None:
+    meta = read_json(run_dir / "metadata.json")
+    write_json(run_dir.parent / latest_name, {"run_id": run_dir.name, "run_dir": rel(run_dir, root),
+                                               "completed_utc": meta.get("completed_utc")})
+
+
+def data_lineage(cfg: dict[str, Any], root: Path, upto: str) -> dict[str, Any]:
+    """Find the data runs that match THIS config: validation -> prep -> split -> patches.
+
+    Each run is located by its content fingerprint (raw-file hashes, parent run
+    ID and the config sections it depends on), so several configurations can
+    coexist and a model always resolves to the exact data it was built for.
+    upto: "prep", "split" or "patches". Raises RuntimeError if a stage has not
+    been run for this configuration.
+    """
+    from src.validation import require_validated_raw_data
+
+    stages = ["prep", "split", "patches"]
+    if upto not in stages:
+        raise ValueError(f"upto must be one of {stages}")
+    p = cfg["paths"]
+    out: dict[str, Any] = {"validation": require_validated_raw_data(cfg, root)}
+
+    def find(base: Path, fp: str, what: str) -> tuple[Path, dict[str, Any]]:
+        run = reusable_run(base, root, fp)
+        if run is None:
+            raise RuntimeError(f"No {what} run matches the current raw data and config. Run the {what} stage first.")
+        return load_run(run, what)
+
+    out["prep"] = find(root / p["processed_dir"], prep_fingerprint(cfg, out["validation"]["sha256"]), "prepare_dataset")
+    if upto == "prep":
+        return out
+    prep_id = out["prep"][0].name
+    out["split"] = find(root / p["splits_dir"], split_fingerprint(cfg, prep_id), "split_dataset")
+    if upto == "split":
+        return out
+    out["patches"] = find(root / p["patches_dir"], patches_fingerprint(cfg, prep_id, out["split"][0].name), "create_patches")
+    return out

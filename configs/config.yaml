@@ -138,6 +138,19 @@ patching:
   min_labelled_fraction: 0.05 # drop patches where both tasks are < 5 % labelled
 
 # -----------------------------------------------------------------------------
+# Optional extra inputs and training samples (defaults = baseline model)
+# -----------------------------------------------------------------------------
+features:
+  # Spectral indices added as input channels at load time. Each index adds 3
+  # channels (pre, post, post - pre): ndvi = (B8-B4)/(B8+B4), nbr = (B8-B12)/(B8+B12),
+  # ndmi = (B8-B11)/(B8+B11). model.input_channels must include them.
+  indices: []
+train_patches:
+  # stride < patch_size adds overlapping TRAIN patches lying fully inside kept
+  # train cells (val/test unchanged). 128 = no extra patches.
+  stride: 128
+
+# -----------------------------------------------------------------------------
 # Model: multi-task U-Net (shared encoder, two task-specific decoders)
 # -----------------------------------------------------------------------------
 model:
@@ -148,6 +161,7 @@ model:
   dropout: 0.2                # bottleneck only
   batch_norm: true
   decoder: separate           # separate = one decoder per task; shared = lighter variant
+  upsampling: transpose       # transpose = 2x2 transposed conv; bilinear = resize + 3x3 conv
   heads:
     landcover:
       num_classes: 5

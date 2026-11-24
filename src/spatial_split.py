@@ -178,3 +178,25 @@ def search_assignment(grid: CellGrid, stats: dict[str, np.ndarray], usable: np.n
         )
     return best, {"n_candidates": int(split_cfg["n_candidates"]), "n_feasible": n_feasible,
                   "score_patch_plus_positive_share_error": best_score}
+
+
+def overlapping_train_windows(cell_split: np.ndarray, patch: int, stride: int) -> list[tuple[int, int]]:
+    """Pixel offsets (row, col) of extra train windows on a `stride` grid.
+
+    A window is kept only if every patch cell it touches is a kept TRAIN cell
+    (code 0 in cell_split; dropped/val/test cells are -1/1/2), so extra windows
+    never reach into buffer, validation or test areas. Windows that coincide
+    with the regular patch grid are skipped (they already exist).
+    """
+    if stride <= 0 or patch % stride:
+        raise ValueError("stride must be a positive divisor of patch")
+    nr, nc = cell_split.shape
+    out = []
+    for r in range(0, nr * patch - patch + 1, stride):
+        for c in range(0, nc * patch - patch + 1, stride):
+            if r % patch == 0 and c % patch == 0:
+                continue
+            cells = cell_split[r // patch:(r + patch - 1) // patch + 1, c // patch:(c + patch - 1) // patch + 1]
+            if (cells == 0).all():
+                out.append((r, c))
+    return out
