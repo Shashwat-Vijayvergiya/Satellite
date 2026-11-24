@@ -2,7 +2,7 @@
 
 Final-year project. Study area: Kaziranga / Karbi Anglong region, Assam, India (EPSG:32646, 30 m, 3009 x 3704 px, about 90 x 111 km).
 
-> **Status:** complete and verified. The data is validated, the pipeline is implemented with 57 passing tests, the model is trained and evaluated on a held-out region, and full-scene maps are generated. The full `./run_pipeline.sh` run finished all 7 stages with exit code 0.
+> **Status:** complete and verified. The data is validated, the pipeline is implemented with 62 passing tests, the model is trained and evaluated on a held-out region, and full-scene maps are generated. Three improvement experiments were compared on validation; the winner (E3) is now the default model. The full `./run_pipeline.sh` run finished all 7 stages with exit code 0.
 
 ## Overview
 
@@ -11,7 +11,7 @@ A multi-task U-Net (TensorFlow/Keras) segments bi-temporal Sentinel-2 composites
 - **Task A, land cover:** 5 classes from ESA WorldCover 2021 (tree cover, grassland, cropland, built-up, water).
 - **Task B, forest loss 2021-2023:** binary, from Hansen Global Forest Change v1.12. This is *gross stand-replacement forest-cover loss*, not strictly deforestation.
 
-**Input:** pre composite (Nov 2020 - Feb 2021) and post composite (Nov 2023 - Feb 2024), bands B2, B3, B4, B8, B11, B12, stacked into **12 channels**. `nobs` is dropped; see below.
+**Input:** pre composite (Nov 2020 - Feb 2021) and post composite (Nov 2023 - Feb 2024), bands B2, B3, B4, B8, B11, B12, stacked into 12 channels, plus NDVI and NBR (pre, post and change) = **18 model input channels**. `nobs` is dropped; see below.
 
 ### Key decisions (all in [`configs/config.yaml`](configs/config.yaml))
 
@@ -23,10 +23,11 @@ A multi-task U-Net (TensorFlow/Keras) segments bi-temporal Sentinel-2 composites
 | Land-cover labels | Raw IDs 10/30/40/50/80 map to classes 0-4. IDs 0/20/60/90 map to 255 (ignore). Pixels with `loss_target == 1` are also ignored, because their 2021 label is stale in the 2023-24 image. |
 | Forest-loss labels | `loss_target` used as exported: 1 = loss 2021-23 on >= 30 % canopy (2000), 0 = no loss, 255 = ignore. |
 | Spatial split | 512 px blocks (4 x 4 patches) assigned whole to train/val/test **before** patching, with a 1-patch buffer. The seeded search (seed 42) requires >= 10,000 loss pixels in val and test and >= 10,000 pixels of every class in every split, and matches 70/15/15 for both patches and loss pixels. |
-| Patches | 128 x 128, stride 128 (no overlap). |
-| Model | Shared encoder (16-32-64-128, bottleneck 256), separate decoders, softmax(5) and sigmoid(1) heads. A lighter shared-decoder variant and a single-task U-Net baseline are also implemented. |
-| Losses | Land cover: class-weighted CE (sqrt inverse frequency, clipped 0.2-10). Forest loss: positive-weighted BCE (sqrt(neg/pos), capped at 10) + soft Dice, or focal + Dice. All ignore 255, normalised by valid pixels. |
+| Patches | 128 x 128, stride 128 (no overlap) for val/test. Train additionally gets overlapping patches at stride 64 that lie fully inside train cells (1,082 train patches instead of 317). |
+| Model | Shared encoder (16-32-64-128, bottleneck 256), separate decoders with bilinear upsampling + 3x3 conv, softmax(5) and sigmoid(1) heads (3,146,726 parameters). A lighter shared-decoder variant and a single-task U-Net baseline are also implemented. |
+| Losses | Land cover: class-weighted CE (sqrt inverse frequency, clipped 0.2-3). Forest loss: positive-weighted BCE (sqrt(neg/pos), capped at 10) + soft Dice, or focal + Dice. All ignore 255, normalised by valid pixels. |
 | Threshold | Tuned on **validation only** (max F1), then applied unchanged to test and to the full-scene maps. |
+| Experiments | Overlay configs in `configs/experiments/` (E1-E3, `baseline.yaml`). Selected on validation only (mIoU + PR-AUC); only the winner was evaluated on test. See [docs/RESULTS.md](docs/RESULTS.md) §1. |
 | Reproducibility | Fixed seeds. Every stage writes a timestamped run directory with `metadata.json` (sources, hashes, config, lineage). Downstream stages refuse stale or incomplete upstream runs. |
 
 ## Current data split (measured)
@@ -64,7 +65,7 @@ satellite_landcover_deforestation/
 │   ├── validation.py  preprocessing.py  spatial_split.py  dataset.py
 │   ├── losses.py  metrics.py  inference.py  visualization.py  runs.py  cli.py
 │   └── models/  unet.py  multitask_unet.py
-├── tests/                     # 57 unit tests (synthetic arrays only inside tests)
+├── tests/                     # 62 unit tests (synthetic arrays only inside tests)
 ├── requirements.txt  requirements-demo.txt  pytest.ini
 ├── run_pipeline.sh            # Linux/macOS runner
 └── run_pipeline.ps1           # Windows PowerShell runner
@@ -97,7 +98,7 @@ pip install -r requirements.txt
 Stage order: `inspect_rasters -> prepare_dataset -> split_dataset -> create_patches -> train -> evaluate -> predict`.
 
 ```bash
-python -m pytest -q                       # 57 tests
+python -m pytest -q                       # 62 tests
 ./run_pipeline.sh --smoke-test            # tiny end-to-end run (must pass first)
 ./run_pipeline.sh                         # full run
 ```
@@ -111,21 +112,23 @@ Resume training: `python scripts/train.py --config configs/config.yaml --resume 
 
 ## Results (held-out geographic test region)
 
-From the final full pipeline run (`eval_20261124_171655`); details in [docs/RESULTS.md](docs/RESULTS.md).
+Final model: experiment E3 (`exp_e3_20261124_200023`, evaluation `eval_20261124_203857`); details in [docs/RESULTS.md](docs/RESULTS.md).
 
-| Task | Metric | Model | Trivial baseline |
-|---|---|---|---|
-| Land cover | Overall accuracy | **0.877** | 0.644 (majority class) |
-| Land cover | Mean IoU / mean Dice | **0.561 / 0.669** | 0.129 / n/a |
-| Land cover | IoU tree / crop / water / built-up / grass | 0.890 / 0.720 / 0.771 / 0.266 / 0.159 | |
-| Forest loss | Precision / Recall / F1 / IoU | **0.391 / 0.702 / 0.502 / 0.335** | F1 0 (all "no loss") |
-| Forest loss | PR-AUC | **0.558** | 0.0105 (random) |
-| Forest loss | Threshold (tuned on validation) | 0.43 | |
+| Task | Metric | E3 (final) | Baseline model | Trivial baseline |
+|---|---|---|---|---|
+| Land cover | Overall accuracy | **0.889** | 0.877 | 0.644 (majority class) |
+| Land cover | Mean IoU / mean Dice | **0.600 / 0.708** | 0.561 / 0.669 | 0.129 / n/a |
+| Land cover | IoU tree / crop / water / built-up / grass | 0.900 / 0.744 / 0.789 / 0.398 / 0.169 | 0.890 / 0.720 / 0.771 / 0.266 / 0.159 | |
+| Forest loss | Precision / Recall / F1 / IoU | **0.449 / 0.694 / 0.545 / 0.375** | 0.391 / 0.702 / 0.502 / 0.335 | F1 0 (all "no loss") |
+| Forest loss | PR-AUC | **0.584** | 0.558 | 0.0105 (random) |
+| Forest loss | Threshold (tuned on validation) | 0.70 | 0.43 | |
 
-- Training took 8.8 min on CPU (best epoch 24 of 32).
-- Retraining the same configuration changed the scores by about ±0.01.
-- Grassland and built-up are the weak classes.
-- The full-scene maps over-estimate forest-loss area (258.6 km² vs 135.6 km² in Hansen) and built-up area (about 2x). Use them to show *where*, not *how much*.
+Model selection (validation mIoU + PR-AUC): baseline 1.044, E1 1.057, E2 1.069, **E3 1.130**.
+
+- **Training:** E3 took 37.6 min on CPU (best epoch 14 of 22). Retraining the same configuration changes the scores by about ±0.01.
+- **Weak classes:** grassland is still weak (WorldCover grassland/cropland confusion). Built-up improved most (IoU 0.27 → 0.40).
+- **Full-scene maps:** they still over-estimate forest-loss area (248.5 km² vs 135.6 km² in Hansen). Use them to show *where*, not *how much*.
+- **Baseline:** the original model can be reproduced with `configs/experiments/baseline.yaml` or git tag `baseline-v1`.
 
 **These scores measure agreement with the reference labels (ESA WorldCover 2021, Hansen GFC v1.12), not independently verified real-world accuracy.**
 

@@ -21,11 +21,13 @@
      │  decides the patch windows BEFORE any patch is cut
      ▼
  [4] create_patches ──► data/patches/patches_*/
-     │  128 x 128 patches (stride 128) per split, manifest.csv,
+     │  128 x 128 patches (stride 128) per split, plus overlapping TRAIN
+     │  patches (stride 64, fully inside train cells), manifest.csv,
      │  normalisation stats from TRAIN patches only
      ▼
  [5] train ──► outputs/checkpoints/train_*/
      │  multi-task U-Net, masked losses, early stopping, best/last checkpoints
+     │  (experiments: --experiment NAME → exp_<name>_*, scored with evaluate --val-only)
      ▼
  [6] evaluate ──► outputs/reports/evaluation/eval_*/ + outputs/plots/eval_*/
      │  threshold tuned on VALIDATION, metrics on TEST region only
@@ -46,10 +48,12 @@
 | Step | Method |
 |---|---|
 | Input stack | pre [B2, B3, B4, B8, B11, B12] + post [same] = 12 channels |
+| Spectral indices | computed at load time from raw DN: NDVI = (B8-B4)/(B8+B4) and NBR = (B8-B12)/(B8+B12), each as pre, post and post - pre = 6 channels (0 where the denominator is 0). Model input = 12 normalised bands + 6 index channels = **18 channels**. Configurable (`features.indices`; `ndmi` is also available). |
 | `nobs` | Dropped (configurable). No missing pixels exist, and `nobs` reflects orbit overlap. Validity still uses `nobs > 0` and non-zero reflectance in both dates. |
 | No data | Pixels invalid in either date get label 255 in both tasks (none in this scene) |
 | Clipping | reflectance DN capped at 10000 (14 pixels affected) |
 | Normalisation | per channel: clip to the train 1st-99th percentile, then (x - mean) / std of the clipped train values. Patches are stored as raw DN and normalised at load time. |
+| Overlapping train patches | `train_patches.stride: 64` adds 765 train windows at 50 % overlap. A window is kept only if every 128 px cell it touches is a kept train cell, so it never reaches the buffer, val or test. Normalisation stats and class weights use the 317 non-overlapping train patches only. |
 | Augmentation | train only: random horizontal/vertical flip and 90° rotation, applied identically to image and both label maps |
 
 ## 3. Model architecture
@@ -59,41 +63,43 @@
 **Multi-task design:** one shared encoder feeds two task-specific decoders. Land cover and forest loss both depend on the same spectral and textural cues (canopy, bare soil, moisture), so sharing the encoder lets each task benefit from the other's supervision and halves the encoder cost.
 
 ```
- image (128,128,12)
+ image (128,128,18)
    enc0  2x[3x3 conv 16 + BN + ReLU] ──────────────────────────┐ skip
    pool → enc1  2x[conv 32] ──────────────────────────────┐    │
    pool → enc2  2x[conv 64] ─────────────────────────┐    │    │
    pool → enc3  2x[conv 128] ───────────────────┐    │    │    │
    pool → bottleneck 2x[conv 256] + dropout 0.2 │    │    │    │
             │                                   │    │    │    │
-            ├─► land-cover decoder: up 2x2 → concat skip → 2x[conv] (128, 64, 32, 16) → 1x1 conv, softmax(5)
+            ├─► land-cover decoder: bilinear up x2 + 3x3 conv → concat skip → 2x[conv] (128, 64, 32, 16) → 1x1 conv, softmax(5)
             └─► forest-loss decoder: same structure                                  → 1x1 conv, sigmoid(1)
 ```
 
 | Part | Parameters |
 |---|---|
-| Shared encoder (4 levels) | 296,256 |
+| Shared encoder (4 levels) | 297,120 |
 | Bottleneck (8 x 8 x 256) | 886,784 |
-| Land-cover decoder + head | 763,845 |
-| Forest-loss decoder + head | 763,777 |
-| **Total** | **2,710,662** |
+| Land-cover decoder + head | 981,445 |
+| Forest-loss decoder + head | 981,377 |
+| **Total** | **3,146,726** |
 
-Variants also implemented (`src/models/`): a lighter **shared-decoder** variant (`model.decoder: shared`, 1.95 M parameters) and a **single-task U-Net** baseline (`build_unet`). Only the separate-decoder multi-task model has been trained and evaluated.
+**Upsampling:** each decoder level uses bilinear resizing followed by a 3x3 convolution (`model.upsampling: bilinear`). It avoids the checkerboard artefacts of 2x2 transposed convolutions and adds about 0.4 M parameters. The baseline model used transposed convolutions (12 input channels, 2,710,662 parameters; `configs/experiments/baseline.yaml`).
 
-**CPU cost (measured on this machine, 12 threads):** about 0.6 s per training step of 8 patches, so roughly 0.5 min per epoch on 317 train + 71 val patches.
+Variants also implemented (`src/models/`): a lighter **shared-decoder** variant (`model.decoder: shared`, 1.95 M parameters with the baseline settings) and a **single-task U-Net** baseline (`build_unet`). Only the separate-decoder multi-task model has been trained and evaluated.
+
+**CPU cost (measured on this machine, 12 threads):** about 0.6 s per training step of 8 patches, so roughly 0.5 min per epoch on 317 train + 71 val patches (baseline) and about 1.7 min per epoch on 1,082 train patches (final model).
 
 ## 4. Losses and class imbalance
 
 All losses skip pixels labelled 255 and divide by the number of valid pixels in the batch (or, for weighted CE, by the summed weight of valid pixels). A batch with many ignored pixels is not diluted, and a fully ignored batch gives exactly 0.
 
-**Land cover:** class-weighted sparse categorical cross-entropy. Weights are smoothed inverse frequencies from the train pixels, w_c = (1/f_c)^0.5, rescaled so the pixel-weighted mean is 1, then clipped to [0.2, 10]. Raw 1/f weights would give built-up about 110 x tree cover and destabilise training, which is why they are smoothed.
+**Land cover:** class-weighted sparse categorical cross-entropy. Weights are smoothed inverse frequencies from the train pixels, w_c = (1/f_c)^0.5, rescaled so the pixel-weighted mean is 1, then clipped to [0.2, 3]. Raw 1/f weights would give built-up about 110 x tree cover and destabilise training, which is why they are smoothed. The baseline used a cap of 10, which gave built-up a weight of 6.9 and made it heavily over-predicted (test precision 0.29); the cap of 3 raised its precision to 0.51.
 
 | Class | Train pixels | Weight |
 |---|---|---|
 | tree_cover | 3,645,486 | 0.659 |
 | grassland | 194,775 | 2.852 |
 | cropland | 902,276 | 1.325 |
-| built_up | 33,276 | 6.901 |
+| built_up | 33,276 | 3.000 (capped; 6.901 uncapped) |
 | water | 314,369 | 2.245 |
 
 **Forest loss:** positive-weighted binary cross-entropy + soft Dice (configurable to focal + Dice). Positives are 1.70% of train pixels (79,703 of 4,676,214). pos_weight = sqrt(neg/pos) = **7.59** (cap 10). Dice directly optimises overlap and is insensitive to the huge number of true negatives.
@@ -137,3 +143,26 @@ Evaluation uses only the held-out spatial **test** blocks. The **validation** bl
 - `deforestation_mask.tif`: uint8, 1 = loss at the validation-tuned threshold, 255 = no data.
 
 It also writes a preview PNG and the area summary (km² and ha; 30 m pixel = 0.09 ha).
+
+## 8. Experiments and model selection
+
+Experiment configs in `configs/experiments/` overlay the main config (`base:` key, deep merge). Each experiment builds on the previous one:
+
+| ID | Change |
+|---|---|
+| E1 | bilinear upsampling, class-weight cap 3 |
+| E2 | E1 + NDVI/NBR channels (18 inputs) |
+| E3 | E2 + overlapping train patches (stride 64) |
+
+`train.py --experiment NAME` writes `exp_<name>_*` runs without replacing the current model. `evaluate.py --val-only` scores a run on validation only.
+
+**Selection rule (fixed before training):** maximise validation land-cover mIoU + validation forest-loss PR-AUC. Only the winner is evaluated on the test region, once.
+
+| Model | Score |
+|---|---|
+| Baseline | 1.044 |
+| E1 | 1.057 |
+| E2 | 1.069 |
+| **E3** | **1.130** |
+
+E3 became the default (`config.yaml`). Results are in [RESULTS.md](RESULTS.md).

@@ -123,14 +123,14 @@ Findings:
 Pipeline of 7 command-line stages, all settings in one `configs/config.yaml`:
 
 1. **inspect_rasters** – strict validation (C6); any error → exit code 1, pipeline stops.
-2. **prepare_dataset** – stack pre + post bands (12 channels), clip reflectance, validity mask, remap WorldCover to 5 classes, build both label maps with ignore rules.
+2. **prepare_dataset** – stack pre + post bands (12 channels; NDVI/NBR index channels are added at load time → 18 model inputs), clip reflectance, validity mask, remap WorldCover to 5 classes, build both label maps with ignore rules.
 3. **split_dataset** – geographic block split into train/val/test **before** cutting patches.
-4. **create_patches** – 128 x 128 patches, normalisation statistics from the training region only, manifest.
-5. **train** – multi-task U-Net with masked, weighted losses, early stopping, checkpoints.
+4. **create_patches** – 128 x 128 patches (plus overlapping training patches at stride 64 inside the training region), normalisation statistics from the training region only, manifest.
+5. **train** – multi-task U-Net with masked, weighted losses, early stopping, checkpoints. Improvement experiments are trained separately and compared on validation only (model selection).
 6. **evaluate** – threshold tuned on validation, metrics on the held-out test region.
 7. **predict** – full-scene inference to GeoTIFF maps, preview image and area summary.
 
-Engineering guarantees (part of the design): fail-fast scripts (exit code 1 on any error) and pipeline runners that stop at the first failed stage; every stage writes a timestamped, versioned run folder with metadata (source files and hashes, configuration, parent run IDs); later stages refuse stale, incomplete or mismatched inputs; unchanged stages are reused via a content fingerprint; fixed random seed 42; 57 automated unit tests (synthetic data only inside tests); optional Streamlit web demo.
+Engineering guarantees (part of the design): fail-fast scripts (exit code 1 on any error) and pipeline runners that stop at the first failed stage; every stage writes a timestamped, versioned run folder with metadata (source files and hashes, configuration, parent run IDs); later stages refuse stale, incomplete or mismatched inputs; unchanged stages are reused via a content fingerprint; fixed random seed 42; 62 automated unit tests (synthetic data only inside tests); optional Streamlit web demo.
 
 System architecture layers: Data layer (validation → prepared arrays → spatial split → patches) → Model layer (tf.data loader with augmentation → multi-task U-Net → masked losses → training) → Evaluation and output layer (validation threshold → test metrics and plots → full-scene tiled inference → GeoTIFFs, PNG, area summary → demo). Cross-cutting: single config file, run metadata/lineage, tests.
 
@@ -138,6 +138,7 @@ System architecture layers: Data layer (validation → prepared arrays → spati
 
 **Preprocessing**
 - Input = pre [B2, B3, B4, B8, B11, B12] + post [same] = **12 channels**. The `nobs` band was **dropped** as an input (configurable): validation found no missing pixels, and nobs (4–84) mainly reflects satellite orbit overlap, a location artefact the model could exploit. Validity still requires non-zero reflectance and nobs > 0 in both dates.
+- **Spectral indices** (added in experiment E2, kept in the final model): NDVI = (B8−B4)/(B8+B4) and NBR = (B8−B12)/(B8+B12), each for the pre date, the post date and their change (post − pre) = 6 extra channels, computed from raw values when patches are loaded. The model input is therefore **18 channels** (12 normalised bands + 6 indices). NBR change (dNBR) is a standard burn/clearing indicator; NDVI change captures canopy loss.
 - Reflectance clipped at 10000 DN.
 - **Normalisation:** per channel, clip to the 1st–99th percentile of the **training region**, then standardise with the training mean and standard deviation (computed on 5,193,728 training pixels only, to avoid leakage). Patches are stored as raw values and normalised when loaded.
 - **Label remapping:** WorldCover 10, 30, 40, 50, 80 → classes 0–4 (tree cover, grassland, cropland, built-up, water); 0, 20, 60, 90 → 255 (ignore; too rare: 0.48% together). Land-cover label also set to 255 where loss_target = 1. Forest-loss label = loss_target (1/0/255).
@@ -154,19 +155,19 @@ System architecture layers: Data layer (validation → prepared arrays → spati
 | Validation | 71 | 16,898 | 762,491 | 51,619 | 282,192 | 15,074 | 28,189 |
 | Test | 108 | 17,504 | 1,121,364 | 52,582 | 511,235 | 12,307 | 44,609 |
 
-**Patches:** 128 x 128 px (3.84 km), stride 128 (no overlap), 496 patches stored as .npz with a manifest CSV (patch ID, split, location, per-class pixel counts, forest-loss pixel count, valid pixels).
+**Patches:** 128 x 128 px (3.84 km), stride 128 (no overlap), 496 base patches stored as .npz with a manifest CSV (patch ID, split, location, per-class pixel counts, forest-loss pixel count, valid pixels). **Final model (experiment E3):** 765 extra *overlapping* training patches at stride 64 (50% overlap), each lying entirely inside kept training cells so they never touch the buffer, validation or test regions → 1,082 training patches. Normalisation statistics and class weights are computed from the 317 non-overlapping training patches only. Validation and test patches are unchanged.
 
 **Data pipeline:** tf.data reads patches lazily (memory-efficient); training augmentation = random horizontal/vertical flips and 90° rotations applied identically to image and both label maps.
 
 **Model: multi-task U-Net**
 - Why U-Net: per-pixel labels need both context (encoder downsampling) and fine detail (decoder upsampling with skip connections that restore field edges, river banks, clearing outlines); works well with small datasets (hundreds of patches) and is CPU-friendly.
 - Why multi-task: both tasks rely on the same spectral/texture cues; a shared encoder lets each task benefit from the other and halves encoder cost.
-- Architecture: input 128 x 128 x 12 → encoder 4 levels, each two 3x3 convolutions + batch normalisation + ReLU, then 2x2 max-pooling, filters **16, 32, 64, 128** → bottleneck **256 filters** (8 x 8) with dropout 0.2 → **two separate decoders**, each 4 levels of 2x2 transposed-convolution upsampling + skip concatenation + two 3x3 convolutions (128, 64, 32, 16 filters) → heads: **1x1 conv softmax (5 classes)** for land cover and **1x1 conv sigmoid (1 channel)** for forest loss.
-- Parameters: encoder 296,256; bottleneck 886,784; land-cover decoder + head 763,845; forest-loss decoder + head 763,777; **total 2,710,662**. (A lighter shared-decoder variant with 1,946,902 parameters and a single-task U-Net are implemented but were not trained/evaluated.)
+- Architecture: input 128 x 128 x 18 → encoder 4 levels, each two 3x3 convolutions + batch normalisation + ReLU, then 2x2 max-pooling, filters **16, 32, 64, 128** → bottleneck **256 filters** (8 x 8) with dropout 0.2 → **two separate decoders**, each 4 levels of **bilinear upsampling x2 + 3x3 convolution** (avoids checkerboard artefacts of transposed convolutions) + skip concatenation + two 3x3 convolutions (128, 64, 32, 16 filters) → heads: **1x1 conv softmax (5 classes)** for land cover and **1x1 conv sigmoid (1 channel)** for forest loss.
+- Parameters: encoder 297,120; bottleneck 886,784; land-cover decoder + head 981,445; forest-loss decoder + head 981,377; **total 3,146,726**. (The baseline model — 12 inputs, transposed-convolution upsampling — had 2,710,662.) (A lighter shared-decoder variant — 1,946,902 parameters with the baseline settings — and a single-task U-Net are implemented but were not trained/evaluated.)
 
 **Losses and class imbalance**
 - All losses ignore label 255 and are normalised by the number of valid pixels in the batch.
-- Land cover: **class-weighted cross-entropy**; weights = (1/frequency)^0.5 from training pixels, rescaled to mean 1, clipped to [0.2, 10] (raw inverse frequency would weight built-up about 110x tree cover and destabilise training). Weights: tree 0.659, grassland 2.852, cropland 1.325, built-up 6.901, water 2.245.
+- Land cover: **class-weighted cross-entropy**; weights = (1/frequency)^0.5 from training pixels, rescaled to mean 1, clipped to [0.2, 3] (raw inverse frequency would weight built-up about 110x tree cover and destabilise training). Weights: tree 0.659, grassland 2.852, cropland 1.325, built-up 3.000 (capped), water 2.245. The baseline used a cap of 10 (built-up weight 6.901), which made built-up heavily over-predicted (precision 0.29); lowering the cap to 3 was experiment E1.
 - Forest loss: **positive-weighted binary cross-entropy + soft Dice loss**; positives are 1.70% of training pixels (79,703 of 4,676,214); positive weight = sqrt(neg/pos) = **7.59** (cap 10). Focal + Dice is available as an option.
 - Total loss = 1.0 x land-cover loss + 1.0 x forest-loss loss.
 - Formulas: weighted CE L = −Σ w_y log p_y / Σ w_y over valid pixels; BCE+Dice L = mean(−(w⁺ y log p + (1−y) log(1−p))) + 1 − (2Σpy + 1)/(Σp + Σy + 1).
@@ -174,11 +175,22 @@ System architecture layers: Data layer (validation → prepared arrays → spati
 **Training**
 - Adam, learning rate 0.001, ReduceLROnPlateau (x0.5 after 3 stagnant epochs, min 1e-5), batch size 8, up to 40 epochs, early stopping on validation loss (patience 8, best weights restored), checkpoints of best and last model, resume support, per-epoch logging of per-task losses and metrics.
 - A **smoke test** (16 patches per split, 1 epoch) runs the whole pipeline end to end in about 1 minute before full training.
-- Hardware: ordinary 12-thread laptop CPU, no GPU. Speed ≈ 0.6 s per batch of 8 (≈ 0.5 min per epoch).
+- Hardware: ordinary 12-thread laptop CPU, no GPU. Speed ≈ 0.6 s per batch of 8 (≈ 0.5 min per epoch for the baseline, ≈ 1.7 min per epoch for the final model with 1,082 training patches).
+
+**Model selection (improvement experiments)**
+- Starting from the baseline, three cumulative experiments were run: **E1** = bilinear upsampling + class-weight cap 3; **E2** = E1 + NDVI/NBR channels; **E3** = E2 + overlapping training patches. Each uses an overlay config file and is stored as a separate versioned run, so the baseline was never overwritten.
+- **Selection rule, fixed before training:** highest validation land-cover mIoU + validation forest-loss PR-AUC. The test region was **not** used to choose between models; only the winner was evaluated on test, once.
+
+| Model | Val mIoU | Val PR-AUC | Score |
+|---|---|---|---|
+| Baseline | 0.581 | 0.462 | 1.044 |
+| E1 | 0.573 | 0.485 | 1.057 |
+| E2 | 0.591 | 0.478 | 1.069 |
+| **E3 (final)** | **0.628** | **0.502** | **1.130** |
 
 **Evaluation method**
 - Only the held-out test blocks are used for final scores; validation blocks are used for early stopping and threshold selection.
-- Forest-loss threshold: swept 0.05–0.95 (step 0.01) on **validation**; F1-maximising value **0.43** fixed and applied unchanged to test and to the full-scene map.
+- Forest-loss threshold: swept 0.05–0.95 (step 0.01) on **validation**; F1-maximising value **0.70** fixed (baseline model: 0.43) and applied unchanged to test and to the full-scene map.
 - Land-cover metrics: overall accuracy (OA), per-class IoU = TP/(TP+FP+FN), mean IoU, precision, recall, F1 (= Dice), confusion matrix.
 - Forest-loss metrics: precision, recall, F1/Dice, IoU, **PR-AUC** (average precision; a random model scores the positive prevalence), confusion matrix, threshold analysis. Accuracy is not meaningful at ~1% prevalence.
 - Reference baselines: majority class ("always tree cover") for land cover; prevalence for PR-AUC.
@@ -187,53 +199,60 @@ System architecture layers: Data layer (validation → prepared arrays → spati
 
 **Demo:** optional Streamlit web app with three tabs: full-scene maps with GeoTIFF downloads; test metrics and figures; live prediction on any 512 x 512 px window compared side by side with reference labels.
 
-### C10. Results (all measured on the held-out test region; final run)
-- Training: best epoch 24 of 32 (early stopping), **8.8 min** on CPU. Best epoch: train loss 1.268 / validation loss 1.451; land-cover mIoU train 0.603 / validation 0.581; forest-loss F1@0.5 train 0.473 / validation 0.473 (small gap → no strong overfitting).
+### C10. Results (all measured on the held-out test region; final model = E3)
+- Training (E3): 1,082 training patches, best epoch 14 of 22 (early stopping), **37.6 min** on CPU. Best epoch: train loss 1.133 / validation loss 1.321; land-cover mIoU train 0.638 / validation 0.628; forest-loss F1@0.5 train 0.511 / validation 0.492 (small gap → no strong overfitting).
 
 **Land cover (test, 108 patches, 1,742,097 labelled pixels):**
-| Metric | Model | Majority-class baseline |
-|---|---|---|
-| Overall accuracy | **0.877** | 0.644 |
-| Mean IoU | **0.561** | 0.129 |
-| Mean Dice | **0.669** | — |
+| Metric | Final model (E3) | Baseline model | Majority-class baseline |
+|---|---|---|---|
+| Overall accuracy | **0.889** | 0.877 | 0.644 |
+| Mean IoU | **0.600** | 0.561 | 0.129 |
+| Mean Dice | **0.708** | 0.669 | — |
 
-| Class | IoU | Precision | Recall | F1 | Reference px |
-|---|---|---|---|---|---|
-| Tree cover | 0.890 | 0.956 | 0.929 | 0.942 | 1,121,364 |
-| Cropland | 0.720 | 0.863 | 0.813 | 0.837 | 511,235 |
-| Water | 0.771 | 0.815 | 0.933 | 0.870 | 44,609 |
-| Built-up | 0.266 | 0.293 | 0.741 | 0.420 | 12,307 |
-| Grassland | 0.159 | 0.219 | 0.369 | 0.275 | 52,582 |
-Validation: OA 0.861, mIoU 0.581, mean Dice 0.695.
+| Class | IoU | Precision | Recall | F1 | Baseline-model IoU | Reference px |
+|---|---|---|---|---|---|---|
+| Tree cover | 0.900 | 0.962 | 0.934 | 0.948 | 0.890 | 1,121,364 |
+| Cropland | 0.744 | 0.866 | 0.841 | 0.853 | 0.720 | 511,235 |
+| Water | 0.789 | 0.810 | 0.968 | 0.882 | 0.771 | 44,609 |
+| Built-up | 0.398 | 0.506 | 0.650 | 0.569 | 0.266 | 12,307 |
+| Grassland | 0.169 | 0.231 | 0.387 | 0.290 | 0.159 | 52,582 |
+Validation (E3): OA 0.876, mIoU 0.628, mean Dice 0.738.
 
-**Forest-cover loss 2021–2023 (threshold 0.43 from validation):**
-| Metric | Test | Validation |
-|---|---|---|
-| Precision | **0.391** | 0.487 |
-| Recall | **0.702** | 0.460 |
-| F1 = Dice | **0.502** | 0.473 |
-| IoU | **0.335** | 0.310 |
-| PR-AUC | **0.558** | 0.462 |
-| Random PR-AUC (prevalence) | 0.0105 | 0.0166 |
-| TP / FP / FN | 12,284 / 19,128 / 5,220 | 7,775 / 8,202 / 9,123 |
+**Forest-cover loss 2021–2023 (threshold 0.70 from validation):**
+| Metric | Test (E3) | Validation (E3) | Test (baseline model) |
+|---|---|---|---|
+| Precision | **0.449** | 0.503 | 0.391 |
+| Recall | **0.694** | 0.499 | 0.702 |
+| F1 = Dice | **0.545** | 0.501 | 0.502 |
+| IoU | **0.375** | 0.334 | 0.335 |
+| PR-AUC | **0.584** | 0.502 | 0.558 |
+| Random PR-AUC (prevalence) | 0.0105 | 0.0166 | 0.0105 |
+| TP / FP / FN | 12,140 / 14,911 / 5,364 | 8,435 / 8,328 / 8,463 | 12,284 / 19,128 / 5,220 |
 
-- PR-AUC is about **53 times** the random level.
-- Confusion: 99% of no-loss pixels correctly rejected; 70% of loss pixels detected.
-- Grassland: of reference grassland, 36.9% correct, 36.4% predicted as cropland, 18.2% as tree cover (dry-season spectral similarity; WorldCover grassland is uncertain). Built-up over-predicted (high recall 0.741, low precision 0.293) as a side effect of its high class weight.
-- Qualitatively, predicted loss areas match clearings visible in the post image and in Hansen, but are smoother/blobbier than the speckled Hansen reference; part of the "false positives" are blob edges and pixels the reference ignores.
-- At threshold 0.5 test F1 would have been 0.512, but thresholds are chosen on validation only (honest hold-out).
-- **Reproducibility:** a second independent training of the same configuration gave test OA 0.877 / mIoU 0.559 / loss F1 0.511 / PR-AUC 0.558 (threshold 0.46) — variation ≈ ±0.01 (TensorFlow CPU kernels not fully deterministic); the data and patches were byte-identical between runs.
+- PR-AUC is about **56 times** the random level.
+- Confusion: 99.1% of no-loss pixels correctly rejected; 69% of loss pixels detected. Compared with the baseline model, 22% fewer false alarms at almost the same recall.
+- Every land-cover class improved; the largest gain is built-up (IoU 0.266 → 0.398, precision 0.29 → 0.51) from capping its class weight at 3.
+- Grassland is still weak: of reference grassland, 38.7% correct, 35.0% predicted as cropland, 16.5% as tree cover (dry-season spectral similarity; WorldCover grassland is uncertain).
+- Qualitatively, predicted loss areas match clearings visible in the post image and in Hansen, but are smoother and more blob-like than the speckled Hansen reference. Some of the "false positives" are blob edges and pixels the reference ignores.
+- At threshold 0.5 the test F1 would have been 0.517 (lower than the 0.545 at the validation-tuned 0.70). Thresholds are chosen on validation only.
+- **Reproducibility:** two independent trainings of the baseline configuration differed by about ±0.01 on all test metrics (TensorFlow CPU kernels are not fully deterministic). The data and patches were byte-identical between runs. The E3 gain over the baseline (+0.039 test mIoU, +0.043 test F1, +0.086 validation selection score) is well outside this noise. E3 itself was trained once.
 
 **Full-scene maps (whole 10,031 km² scene, includes the training region, so not an evaluation):**
-| Class | Predicted (km²) | WorldCover 2021, mapped classes (km²) |
+| Class | Predicted, E3 (km²) | WorldCover 2021, mapped classes (km²) |
 |---|---|---|
-| Tree cover | 6,718.4 | 6,779.8 |
-| Cropland | 2,146.3 | 2,118.2 |
-| Water | 518.3 | 487.3 |
-| Grassland | 464.0 | 368.8 |
-| Built-up | 183.8 | 93.1 |
-- Predicted forest loss: 287,290 px = **258.6 km² (25,856 ha)** vs Hansen reference 135.6 km²; 62.8 km² of the prediction falls on pixels Hansen ignores. The F1-optimal threshold favours recall, so the maps over-estimate loss area (≈1.9x) and built-up (≈2x): use the maps to show **where** change occurs, not as calibrated area estimates.
-- The maps visibly show the Brahmaputra and sandbars (water/grassland) in the north, the forested Karbi Anglong hills, valley cropland, towns as built-up in the south/south-east, and scattered forest loss in the hills.
+| Tree cover | 6,790.2 | 6,779.8 |
+| Cropland | 2,164.6 | 2,118.2 |
+| Water | 550.8 | 487.3 |
+| Grassland | 407.2 | 368.8 |
+| Built-up | 118.1 | 93.1 |
+- Predicted forest loss: 276,100 px = **248.5 km² (24,849 ha)** vs Hansen reference 135.6 km²; 63.3 km² of the prediction falls on pixels Hansen ignores.
+- The F1-optimal threshold favours recall, so the maps over-estimate loss area (≈1.8x). Built-up over-prediction fell from ≈2.0x (baseline model) to ≈1.3x. Use the maps to show **where** change occurs, not as calibrated area estimates.
+- The maps visibly show:
+  - the Brahmaputra and its sandbars (water/grassland) in the north;
+  - the forested Karbi Anglong hills;
+  - valley cropland;
+  - towns as built-up in the south/south-east;
+  - scattered forest loss in the hills.
 
 ### C11. Limitations (include in Results discussion or a short closing paragraph)
 1. Temporal mismatch between labels (WorldCover 2021) and imagery; loss near composite windows can leak.
@@ -246,19 +265,19 @@ Validation: OA 0.861, mIoU 0.581, mean Dice 0.695.
 8. Dry-season imagery only, limiting grassland/cropland separation.
 
 ### C12. Future scope
-More regions/years and several split seeds (confidence intervals); time series and Sentinel-1 radar; spectral indices (NDVI, NBR, dNBR) as inputs; validation against independently interpreted samples; comparison with Random Forest and single-task baselines; distinguishing loss drivers (jhum, plantation, river erosion); calibrated area estimation; web-map deployment.
+More regions/years, several split seeds and repeated training runs (confidence intervals); time series and Sentinel-1 radar; further indices or pretrained encoders; validation against independently interpreted samples; comparison with Random Forest and single-task baselines; distinguishing loss drivers (jhum, plantation, river erosion); calibrated area estimation; web-map deployment.
 
 ## PART D: FIGURES AVAILABLE (real outputs; reference them as placeholders)
 | File | Shows | Suggested section |
 |---|---|---|
 | outputs/plots/split_map.png | train/val/test blocks with buffer + forest-loss pixels per patch cell | Detailed Description (split) or EDA |
-| outputs/plots/eval_20261124_171655/training_curves.png | loss, mIoU, F1 per epoch (train vs val) | Detailed Description (training) or Results |
-| outputs/plots/eval_20261124_171655/confusion_landcover_test.png | land-cover confusion matrix, test | Results |
-| outputs/plots/eval_20261124_171655/confusion_deforestation_test.png | forest-loss confusion matrix, test | Results |
-| outputs/plots/eval_20261124_171655/pr_curve.png | precision-recall curves val/test with random baseline | Results |
-| outputs/plots/eval_20261124_171655/threshold_val.png | threshold tuning on validation | Detailed Description (evaluation) |
-| outputs/plots/eval_20261124_171655/examples_test.png | test patches: pre/post RGB, reference vs predicted land cover and loss | Results |
-| outputs/predictions/pred_20261124_171720/preview.png | full-scene post RGB, predicted land cover, loss probability, loss overlay | Results or Proposed Work |
+| outputs/plots/eval_20261124_203857/training_curves.png | loss, mIoU, F1 per epoch (train vs val) | Detailed Description (training) or Results |
+| outputs/plots/eval_20261124_203857/confusion_landcover_test.png | land-cover confusion matrix, test | Results |
+| outputs/plots/eval_20261124_203857/confusion_deforestation_test.png | forest-loss confusion matrix, test | Results |
+| outputs/plots/eval_20261124_203857/pr_curve.png | precision-recall curves val/test with random baseline | Results |
+| outputs/plots/eval_20261124_203857/threshold_val.png | threshold tuning on validation | Detailed Description (evaluation) |
+| outputs/plots/eval_20261124_203857/examples_test.png | test patches: pre/post RGB, reference vs predicted land cover and loss | Results |
+| outputs/predictions/pred_20261124_204028/preview.png | full-scene post RGB, predicted land cover, loss probability, loss overlay | Results or Proposed Work |
 
 For EDA, also recommend 2 charts the student can create from the tables in C7 (e.g. bar chart of WorldCover class shares; bar chart of forest-loss pixels by year and ignore reasons) — mark them as `[Figure N: ... — create from Table M]`.
 Diagrams to provide as Mermaid code: (1) end-to-end workflow flowchart (7 stages with inputs/outputs and the fail-fast checks), (2) system architecture (three layers), (3) multi-task U-Net architecture.
@@ -281,12 +300,12 @@ Diagrams to provide as Mermaid code: (1) end-to-end workflow flowchart (7 stages
 
 1. **Title page (1 page):** title; "A project report submitted in partial fulfilment of the requirements for the degree of <<DEGREE, e.g. Bachelor of Technology in ...>>"; by <<STUDENT NAME(S)>> (<<ROLL NUMBER(S)>>); under the guidance of <<GUIDE NAME, DESIGNATION>>; <<DEPARTMENT>>, <<INSTITUTION>>, <<CITY>>; <<MONTH YEAR>>. Keep the placeholders as written.
 2. **Table of contents (1 page):** all numbered sections and subsections with page-number placeholders, plus a list of figures and tables.
-3. **Abstract (1 page, 250–300 words):** problem, data (Sentinel-2 bi-temporal composites, WorldCover 2021, Hansen GFC; 10,031 km² of Assam at 30 m), method (validated pipeline, spatial split, multi-task U-Net, masked weighted losses, validation-tuned threshold), key test results (OA 0.877, mIoU 0.561; loss F1 0.502, PR-AUC 0.558 vs 0.0105 random), CPU training in under 10 min, georeferenced maps, and the agreement-not-ground-truth caveat. Add 5–6 keywords.
+3. **Abstract (1 page, 250–300 words):** problem, data (Sentinel-2 bi-temporal composites, WorldCover 2021, Hansen GFC; 10,031 km² of Assam at 30 m), method (validated pipeline, spatial split, multi-task U-Net, masked weighted losses, validation-tuned threshold), key test results of the final model (OA 0.889, mIoU 0.600; loss F1 0.545, PR-AUC 0.584 vs 0.0105 random; improved over the baseline model via validation-only model selection), CPU training in under 40 min, georeferenced maps, and the agreement-not-ground-truth caveat. Add 5–6 keywords.
 4. **Problem Statement (1 page):** use C2 and C3; end with the numbered objectives.
-5. **Proposed Work (4–5 pages):** overview of the proposed system vs existing approaches (short comparison table); **system architecture diagram (Mermaid)**; **workflow flowchart (Mermaid)** of the 7 stages with their inputs/outputs and fail-fast checks; design decisions with brief justifications (multi-task U-Net, 12-channel bi-temporal input, nobs dropped, spatial block split before patching with buffer, masked weighted losses, validation-only threshold, versioned runs and lineage, CPU-friendly sizing); multi-task U-Net architecture diagram (Mermaid) with the layer/parameter table; tools and technologies table (Python 3.12, TensorFlow 2.21/Keras 3.15, NumPy, rasterio/GDAL, scikit-learn, pandas, matplotlib, pytest, Streamlit, Google Earth Engine).
-6. **Detailed Description (7 pages):** one subsection per step of the flowchart, in order, explaining **what is done, why, and how it was implemented** (with the exact parameters from C9): data acquisition (GEE, done beforehand); data validation; preprocessing and normalisation; label remapping and ignore masks (with the temporal strategy C5); spatial split (with split table and split_map figure); patch generation and tf.data loading with augmentation; model architecture; loss functions and imbalance handling (with formulas and weights table); training procedure (with training_curves figure); evaluation method and threshold tuning (with threshold_val figure); full-scene inference and GeoTIFF outputs; reproducibility, testing and demo.
+5. **Proposed Work (4–5 pages):** overview of the proposed system vs existing approaches (short comparison table); **system architecture diagram (Mermaid)**; **workflow flowchart (Mermaid)** of the 7 stages with their inputs/outputs and fail-fast checks; design decisions with brief justifications (multi-task U-Net, 12-band bi-temporal input plus NDVI/NBR change channels (18 inputs), nobs dropped, spatial block split before patching with buffer, masked weighted losses, validation-only threshold, versioned runs and lineage, CPU-friendly sizing); multi-task U-Net architecture diagram (Mermaid) with the layer/parameter table; tools and technologies table (Python 3.12, TensorFlow 2.21/Keras 3.15, NumPy, rasterio/GDAL, scikit-learn, pandas, matplotlib, pytest, Streamlit, Google Earth Engine).
+6. **Detailed Description (7 pages):** one subsection per step of the flowchart, in order, explaining **what is done, why, and how it was implemented** (with the exact parameters from C9): data acquisition (GEE, done beforehand); data validation; preprocessing and normalisation; label remapping and ignore masks (with the temporal strategy C5); spatial split (with split table and split_map figure); patch generation and tf.data loading with augmentation; model architecture; loss functions and imbalance handling (with formulas and weights table); training procedure (with training_curves figure); model selection experiments (E1–E3 table, validation-only rule); evaluation method and threshold tuning (with threshold_val figure); full-scene inference and GeoTIFF outputs; reproducibility, testing and demo.
 7. **Datasets and EDA (1–3 pages, at least one full page of EDA):** dataset table (C4); study area description; validation summary (C6); EDA tables from C7 (band statistics, class distribution, forest-loss statistics, split statistics) and their interpretation (imbalance, spatial concentration of loss, water disagreement, spectral similarity); 2 recommended chart placeholders.
-8. **Results (1 page):** land-cover metrics table (overall and per class, with baseline), forest-loss metrics table (test and validation, with random baseline), 1–2 figure placeholders (confusion matrices and/or examples), and a short discussion: strengths, weak classes and why, area-bias caveat, reproducibility, and a 3–4 line limitations paragraph (C11). Keep the agreement-not-ground-truth statement.
+8. **Results (1 page):** land-cover metrics table (overall and per class, with baseline), forest-loss metrics table (test and validation, with random baseline), 1–2 figure placeholders (confusion matrices and/or examples), and a short discussion: strengths, weak classes and why, improvement over the baseline model, area-bias caveat, reproducibility, and a 3–4 line limitations paragraph (C11). Keep the agreement-not-ground-truth statement.
 9. **References (1 page):** the list in Part E, numbered in order of first citation in the text.
 
 Begin writing the report now, section by section, following Parts B–F exactly.

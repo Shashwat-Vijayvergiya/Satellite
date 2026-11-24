@@ -144,24 +144,24 @@ features:
   # Spectral indices added as input channels at load time. Each index adds 3
   # channels (pre, post, post - pre): ndvi = (B8-B4)/(B8+B4), nbr = (B8-B12)/(B8+B12),
   # ndmi = (B8-B11)/(B8+B11). model.input_channels must include them.
-  indices: []
+  indices: [ndvi, nbr]       # promoted from experiment E2/E3
 train_patches:
   # stride < patch_size adds overlapping TRAIN patches lying fully inside kept
   # train cells (val/test unchanged). 128 = no extra patches.
-  stride: 128
+  stride: 64                 # promoted from experiment E3 (50 % overlap)
 
 # -----------------------------------------------------------------------------
 # Model: multi-task U-Net (shared encoder, two task-specific decoders)
 # -----------------------------------------------------------------------------
 model:
   name: multitask_unet
-  input_channels: 12          # must agree with s2.nobs_mode (12 = drop, 14 = as_channel)
+  input_channels: 18          # 12 bands + 3 x 2 indices; must agree with s2.nobs_mode and features.indices
   base_filters: 16            # small for CPU training
   depth: 4                    # encoder filters 16, 32, 64, 128; bottleneck 256
   dropout: 0.2                # bottleneck only
   batch_norm: true
   decoder: separate           # separate = one decoder per task; shared = lighter variant
-  upsampling: transpose       # transpose = 2x2 transposed conv; bilinear = resize + 3x3 conv
+  upsampling: bilinear        # transpose = 2x2 transposed conv; bilinear = resize + 3x3 conv
   heads:
     landcover:
       num_classes: 5
@@ -182,7 +182,7 @@ loss:
     #   then clipped to class_weight_clip. power 0.5 = sqrt (less extreme than 1/freq).
     class_weights: auto
     class_weight_power: 0.5
-    class_weight_clip: [0.2, 10.0]
+    class_weight_clip: [0.2, 3.0]   # promoted from experiment E1 (was [0.2, 10.0])
   deforestation:
     type: bce_dice             # bce_dice (weighted BCE + Dice) | focal_dice (focal + Dice)
     pos_weight: auto           # auto = (neg / pos) ** pos_weight_power from TRAIN, capped

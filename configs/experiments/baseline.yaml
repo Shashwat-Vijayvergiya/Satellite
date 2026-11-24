@@ -1,0 +1,13 @@
+# The original baseline model (git tag baseline-v1, run train_20261124_170757).
+# config.yaml now holds the promoted E3 settings; this overlay restores the old ones.
+base: ../config.yaml
+features:
+  indices: []
+train_patches:
+  stride: 128
+model:
+  input_channels: 12
+  upsampling: transpose
+loss:
+  landcover:
+    class_weight_clip: [0.2, 10.0]

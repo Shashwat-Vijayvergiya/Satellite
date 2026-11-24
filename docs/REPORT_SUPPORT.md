@@ -33,7 +33,7 @@ The problem is to learn, from freely available satellite imagery, a model that s
 
 ## 5. Proposed system
 
-- **Input:** bi-temporal Sentinel-2 composites (pre 2020-21, post 2023-24), 6 spectral bands each, 12 channels.
+- **Input:** bi-temporal Sentinel-2 composites (pre 2020-21, post 2023-24), 6 spectral bands each (12 channels), plus NDVI and NBR for both dates and their change (6 channels) = 18 model inputs.
 - **Model:** multi-task U-Net with a shared encoder and two decoders. It learns spatial context (texture, shape, neighbourhood) rather than isolated pixel values, and predicts both tasks in one pass.
 - **Training signal:** the existing global products act as reference labels, with explicit masking where they are unreliable (rare classes, stale labels after forest loss, pre-2021 loss, water).
 - **Engineering:**
@@ -79,22 +79,23 @@ metadata/lineage, fail-fast CLIs, unit tests.
 
 ## 8. Data flow
 
-Raw GeoTIFFs (4 rasters + AOI) → `validation_report.json` → `image.npy` (12 ch) + `landcover.npy` + `deforest.npy` → `windows.csv` (split) → `*.npz` patches + `manifest.csv` + `band_stats.json` → `best.keras` → `metrics.json` and plots → `landcover.tif`, `deforestation_prob.tif`, `deforestation_mask.tif`, `area_summary.csv`. The diagram is in METHODOLOGY.md §1.
+Raw GeoTIFFs (4 rasters + AOI) → `validation_report.json` → `image.npy` (12 ch; indices added at load time → 18 model inputs) + `landcover.npy` + `deforest.npy` → `windows.csv` (split) → `*.npz` patches + `manifest.csv` + `band_stats.json` → `best.keras` → `metrics.json` and plots → `landcover.tif`, `deforestation_prob.tif`, `deforestation_mask.tif`, `area_summary.csv`. The diagram is in METHODOLOGY.md §1.
 
 ## 9. Algorithms
 
 - **Spatial block assignment:** seeded random search over whole-block assignments; reject infeasible ones (val/test forest-loss < 10,000 px, any class < 10,000 px in any split); minimise the deviation from 70/15/15 in both patch and forest-loss shares.
 - **Robust normalisation:** per-channel percentile clipping (1-99%) and standardisation, using training pixels only.
-- **U-Net forward pass:** 4 encoder levels (3x3 convolutions, batch norm, ReLU, max-pooling), bottleneck, 4 decoder levels (transposed-convolution upsampling + skip concatenation), with a 1x1 softmax head and a 1x1 sigmoid head.
+- **U-Net forward pass:** 4 encoder levels (3x3 convolutions, batch norm, ReLU, max-pooling), bottleneck, 4 decoder levels (bilinear upsampling + 3x3 convolution, then skip concatenation), with a 1x1 softmax head and a 1x1 sigmoid head.
 - **Masked weighted cross-entropy:** L = -Σ w_y log p_y over valid pixels / Σ w_y over valid pixels.
 - **Masked BCE + soft Dice:** L = mean(-(w⁺ y log p + (1-y) log(1-p))) + 1 - (2 Σ p y + 1)/(Σ p + Σ y + 1), over valid pixels.
+- **Model selection:** three cumulative experiments, ranked by validation mIoU + PR-AUC; only the winner is evaluated on test, once.
 - **Adam optimisation** with early stopping and learning-rate reduction on plateau.
 - **Threshold selection:** maximise F1 over a grid of thresholds on validation pixels.
 - **Overlapping-tile inference:** reflect padding, 128 px tiles with 32 px overlap, probability averaging.
 
 ## 10. Model architecture
 
-Shared encoder 16-32-64-128 filters, bottleneck 256 with dropout 0.2, and two decoders 128-64-32-16. Outputs: softmax(5) land cover and sigmoid(1) forest loss. Total 2,710,662 parameters. Full table in METHODOLOGY.md §3.
+Shared encoder 16-32-64-128 filters, bottleneck 256 with dropout 0.2, and two decoders 128-64-32-16. Outputs: softmax(5) land cover and sigmoid(1) forest loss. Total 3,146,726 parameters (baseline with transposed convolutions and 12 inputs: 2,710,662). Full table in METHODOLOGY.md §3.
 
 ## 11. Evaluation metrics
 
@@ -121,7 +122,7 @@ Definitions are in METHODOLOGY.md §6.
 
 ## 14. Future scope
 
-- Add more regions and years, and repeat with several split seeds to report confidence intervals.
+- Add more regions and years, and repeat with several split seeds and several training runs per experiment to report confidence intervals.
 - Use time series (monthly composites or Sentinel-1 radar, which sees through cloud) to separate grassland from cropland and to date loss events.
 - Validate against independently interpreted samples (high-resolution imagery or field data) to estimate real-world accuracy.
 - Compare against Random Forest and single-task U-Net baselines, and test lighter or pretrained encoders.
