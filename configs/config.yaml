@@ -1,0 +1,265 @@
+# =============================================================================
+# Satellite Image Segmentation for Land Cover and Deforestation Mapping (Assam)
+# Single source of truth for all pipeline stages. Paths are relative to the
+# project root (the folder containing this configs/ directory).
+# =============================================================================
+
+project:
+  name: satellite_landcover_deforestation
+  seed: 42
+
+# -----------------------------------------------------------------------------
+# Paths
+# -----------------------------------------------------------------------------
+paths:
+  raw_dir: data/raw
+  processed_dir: data/processed
+  patches_dir: data/patches
+  splits_dir: data/splits
+  raw:
+    s2_pre: data/raw/s2_pre_2020-21.tif
+    s2_post: data/raw/s2_post_2023-24.tif
+    worldcover: data/raw/worldcover_2021_30m.tif
+    hansen: data/raw/hansen_labels_30m.tif
+    aoi: data/raw/aoi.geojson
+  outputs:
+    checkpoints: outputs/checkpoints
+    plots: outputs/plots
+    predictions: outputs/predictions
+    reports: outputs/reports
+
+# -----------------------------------------------------------------------------
+# Reference grid. Every raster MUST match this exactly (checked by
+# inspect_rasters.py and tests/test_raster_alignment.py). Mismatch = hard fail.
+# -----------------------------------------------------------------------------
+grid:
+  crs: "EPSG:32646"          # WGS 84 / UTM zone 46N
+  pixel_size_m: 30
+  width: 3009                # columns
+  height: 3704               # rows
+  x0: 499980                 # left edge (m)
+  ytop: 2964630              # top edge (m)
+  # Derived (for reference only; code must recompute, not trust these):
+  #   xright  = x0 + width * 30    = 590250
+  #   ybottom = ytop - height * 30 = 2853510
+  # Expected affine transform: (30, 0, 499980, 0, -30, 2964630)
+
+# -----------------------------------------------------------------------------
+# Sentinel-2 composites (pre: 2020-21, post: 2023-24)
+# -----------------------------------------------------------------------------
+s2:
+  bands: [B2, B3, B4, B8, B11, B12, nobs]   # band order inside each GeoTIFF
+  dtype: uint16
+  reflectance_scale: 10000                   # stored as reflectance x 10000
+  nodata_value: 0                            # 0 in all reflectance bands = no valid data
+  spectral_bands: [B2, B3, B4, B8, B11, B12]
+  nobs_band: nobs
+  # How the nobs (number of valid observations) band is used:
+  #   drop       -> input = 6 + 6 = 12 channels  [chosen]
+  #   as_channel -> input = 7 + 7 = 14 channels
+  # Why drop: validation found no missing pixels (nobs >= 4 everywhere), and
+  # nobs (4-84) mostly traces Sentinel-2 orbit overlap, which is a location
+  # artefact the model could exploit. In both modes, pixels with nobs == 0 or
+  # all reflectance == 0 in EITHER date are invalid and ignored in both losses.
+  nobs_mode: drop
+  nobs_clip_max: 50          # clip nobs when it is used as a channel
+  reflectance_clip_max: 10000  # 14 pixels exceed this in the raw data; clipped
+  stack_order: [pre, post]   # input = concat(pre, post) along the channel axis
+  normalization:
+    # Per channel: clip to the [p_low, p_high] percentiles, then standardise
+    # with the mean/std of the clipped values. Statistics come from TRAIN
+    # patches only (no val/test leakage) and are saved with the patch run.
+    method: robust_standardize
+    percentiles: [1, 99]
+
+# -----------------------------------------------------------------------------
+# Hansen Global Forest Change labels (resampled to the 30 m grid)
+# -----------------------------------------------------------------------------
+hansen:
+  bands: [treecover2000, lossyear, datamask, loss_target]
+  loss_target_band: loss_target
+  loss_target_values:
+    loss: 1          # forest loss during 2021-2023
+    no_loss: 0
+    ignore: 255
+
+# -----------------------------------------------------------------------------
+# ESA WorldCover 2021 land-cover labels
+# -----------------------------------------------------------------------------
+worldcover:
+  raw_ids_present: [10, 20, 30, 40, 50, 60, 80, 90]
+  nodata_value: 0
+  ignore_index: 255
+  # Explicit raw ID -> model class mapping. 255 = ignored in the loss.
+  raw_to_model:
+    0: 255     # No data              -> ignore
+    10: 0      # Tree cover
+    20: 255    # Shrubland            -> ignore
+    30: 1      # Grassland
+    40: 2      # Cropland
+    50: 3      # Built-up
+    60: 255    # Bare / sparse veg.   -> ignore
+    80: 4      # Permanent water
+    90: 255    # Herbaceous wetland   -> ignore
+  class_names: [tree_cover, grassland, cropland, built_up, water]   # model ids 0..4
+  # Raw IDs not listed above: 'error' = fail fast; 'ignore' = map to 255.
+  unknown_id_policy: error
+  # The labels are from 2021 and the post imagery from 2023-24. Where
+  # loss_target == 1 the land cover changed, so the 2021 label is stale and
+  # those pixels are ignored in the land-cover loss and metrics.
+  ignore_where_loss_target_is_loss: true
+
+# -----------------------------------------------------------------------------
+# Spatial split: geographic blocks assigned BEFORE any patch is extracted.
+# Stage order: prepare_dataset -> split_dataset -> create_patches.
+# -----------------------------------------------------------------------------
+split:
+  method: spatial_blocks
+  block_size_px: 512          # 4 x 4 patches per block; multiple of patch_size
+  fractions: {train: 0.70, val: 0.15, test: 0.15}   # target share of patches
+  seed: 42
+  # Buffer, in patches: a train patch within this many patch cells of a
+  # val/test block is dropped, and so is a val patch near a test block.
+  # Test patches are never dropped.
+  buffer_patches: 1
+  min_positive_pixels: {val: 10000, test: 10000}    # forest-loss pixels required
+  min_class_pixels: 10000     # every land-cover class must have this many in each split (stable per-class scores)
+  n_candidates: 5000          # seeded block assignments evaluated; best feasible wins
+
+# -----------------------------------------------------------------------------
+# Patching
+# -----------------------------------------------------------------------------
+patching:
+  patch_size: 128
+  stride: 128                 # no overlap
+  # Patches are cut on a fixed 128-px grid from the top-left corner. Partial
+  # patches at the right/bottom edge are dropped (no padding).
+  min_valid_fraction: 0.5     # drop patches with < 50 % valid input pixels
+  min_labelled_fraction: 0.05 # drop patches where both tasks are < 5 % labelled
+
+# -----------------------------------------------------------------------------
+# Model: multi-task U-Net (shared encoder, two task-specific decoders)
+# -----------------------------------------------------------------------------
+model:
+  name: multitask_unet
+  input_channels: 12          # must agree with s2.nobs_mode (12 = drop, 14 = as_channel)
+  base_filters: 16            # small for CPU training
+  depth: 4                    # encoder filters 16, 32, 64, 128; bottleneck 256
+  dropout: 0.2                # bottleneck only
+  batch_norm: true
+  decoder: separate           # separate = one decoder per task; shared = lighter variant
+  heads:
+    landcover:
+      num_classes: 5
+      activation: softmax
+    deforestation:
+      num_classes: 1
+      activation: sigmoid
+
+# -----------------------------------------------------------------------------
+# Losses (all ignore label 255, normalised by the number of valid pixels)
+# -----------------------------------------------------------------------------
+loss:
+  ignore_index: 255
+  landcover:
+    type: weighted_categorical_crossentropy
+    # auto = smoothed inverse frequency from TRAIN pixels:
+    #   w_c = (1 / freq_c) ** power, rescaled so the pixel-weighted mean is 1,
+    #   then clipped to class_weight_clip. power 0.5 = sqrt (less extreme than 1/freq).
+    class_weights: auto
+    class_weight_power: 0.5
+    class_weight_clip: [0.2, 10.0]
+  deforestation:
+    type: bce_dice             # bce_dice (weighted BCE + Dice) | focal_dice (focal + Dice)
+    pos_weight: auto           # auto = (neg / pos) ** pos_weight_power from TRAIN, capped
+    pos_weight_power: 0.5
+    pos_weight_max: 10.0
+    base_weight: 1.0           # weight of the BCE / focal term
+    dice_weight: 1.0
+    focal_alpha: 0.75
+    focal_gamma: 2.0
+  task_weights:
+    landcover: 1.0
+    deforestation: 1.0
+
+# -----------------------------------------------------------------------------
+# Training
+# -----------------------------------------------------------------------------
+training:
+  batch_size: 8
+  epochs: 40
+  learning_rate: 0.001
+  augment: true               # random flips + 90-degree rotations (train only)
+  early_stopping:
+    monitor: val_loss
+    patience: 8
+  reduce_lr_on_plateau:
+    monitor: val_loss
+    factor: 0.5
+    patience: 3
+    min_lr: 1.0e-5
+  checkpoint_dir: outputs/checkpoints   # one run dir per training run
+  smoke_test:                 # used with --smoke-test
+    max_patches_per_split: 16
+    epochs: 1
+    batch_size: 4
+
+# -----------------------------------------------------------------------------
+# Evaluation (test region only; threshold tuned on validation only)
+# -----------------------------------------------------------------------------
+evaluation:
+  deforestation_threshold:
+    tune_on: val              # MUST be 'val'. Never tune on test.
+    search: {start: 0.05, stop: 0.95, step: 0.01}
+    metric: f1
+  n_example_patches: 6        # ground truth vs prediction panels
+  report_dir: outputs/reports
+  plots_dir: outputs/plots
+
+# -----------------------------------------------------------------------------
+# Prediction (full-scene inference)
+# -----------------------------------------------------------------------------
+prediction:
+  tile_size: 128
+  overlap: 32                 # overlapping tiles, probabilities averaged
+  batch_size: 16
+  output_dir: outputs/predictions
+  smoke_window_px: 512        # --smoke-test predicts only a 512 x 512 window
+
+# -----------------------------------------------------------------------------
+# Raw-data validation (scripts/inspect_rasters.py). Hard checks fail the run
+# with exit code 1. "expected_*" values come from the Earth Engine export
+# diagnostics: differences beyond the tolerance are reported as warnings,
+# and the real files are trusted over these numbers.
+# -----------------------------------------------------------------------------
+validation:
+  report_root: outputs/reports/validation      # one timestamped run dir per execution
+  expected_band_counts: {s2_pre: 7, s2_post: 7, worldcover: 1, hansen: 4}
+  expected_dtypes: {s2_pre: uint16, s2_post: uint16, worldcover: uint8, hansen: uint8}
+  reflectance_max_plausible: 10000     # DN; brighter pixels are counted and reported
+  reflectance_over_max_fraction_error: 0.01   # > 1 % of valid pixels above max = hard error
+  min_band_std: {reflectance: 5.0, nobs: 0.1} # std on valid pixels below this = constant band (hard error)
+  min_valid_fraction: 0.90             # S2 valid-pixel coverage below this = hard error
+  expected_nobs_mean_range: [20, 23]   # warning if outside
+  hansen_valid_codes:
+    datamask: [1, 2]                   # 0 would mean no data
+    lossyear_range: [0, 24]
+    treecover_range: [0, 100]
+    loss_target: [0, 1, 255]
+  tree_cover_threshold: 30             # % canopy in 2000 used to define forest
+  loss_years: [21, 22, 23]             # lossyear codes that count as positive
+  expected_worldcover_share_pct:       # share of non-zero WorldCover pixels
+    10: 68.8
+    40: 21.2
+    80: 4.9
+    30: 3.7
+    50: 0.93
+    60: 0.40
+    20: 0.05
+    90: 0.03
+  worldcover_share_tolerance_pp: 0.5   # warn if |actual - expected| > 0.5 percentage points
+  expected_loss_target_counts: {positive: 150715, negative: 9953974, ignore: 1040647}
+  loss_target_count_tolerance_rel: 0.01  # warn if relative difference > 1 %
+  expected_datamask_counts: {land: 11000000, water: 140000}   # approximate ("about")
+  datamask_count_tolerance_rel: 0.05
+  aoi_bounds_tolerance_deg: 0.002      # AOI polygon vs raster footprint (lon/lat)

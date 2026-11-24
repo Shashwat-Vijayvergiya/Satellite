@@ -1,0 +1,31 @@
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Data: ignore contents, keep folder placeholders
+data/**
+!data/**/
+!data/**/.gitkeep
+
+# Outputs: ignore contents, keep folder placeholders
+outputs/**
+!outputs/**/
+!outputs/**/.gitkeep
+
+# Large / binary artifacts anywhere
+*.tif
+*.tiff
+*.h5
+*.keras
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

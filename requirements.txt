@@ -1,0 +1,12 @@
+# Python 3.11-3.13 only. TensorFlow 2.21 has NO wheels for Python 3.14.
+# Recommended: Python 3.12 (64-bit) on Windows.
+# On native Windows the `tensorflow` package is CPU-only (GPU support ended at 2.10).
+tensorflow==2.21.0
+numpy==2.5.5
+rasterio==1.5.2
+scikit-learn==1.9.1
+matplotlib==3.11.2
+pandas==3.1.1
+pyyaml==6.0.4
+tqdm==4.70.1
+pytest==9.2.0
