@@ -114,6 +114,8 @@ Resume training: `python scripts/train.py --config configs/config.yaml --resume 
 
 Final model: experiment E3 (`exp_e3_20261124_200023`, evaluation `eval_20261124_203857`); details in [docs/RESULTS.md](docs/RESULTS.md).
 
+**Trained models on Hugging Face:** [ShashwatVj/assam-landcover-forest-loss-unet](https://huggingface.co/ShashwatVj/assam-landcover-forest-loss-unet) holds the final E3 model at the root and the baseline, E1, E2 and repeat runs in `experiments/`. Each comes with its normalisation stats, config, metrics and a usage example.
+
 | Task | Metric | E3 (final) | Baseline model | Trivial baseline |
 |---|---|---|---|---|
 | Land cover | Overall accuracy | **0.889** | 0.877 | 0.644 (majority class) |
